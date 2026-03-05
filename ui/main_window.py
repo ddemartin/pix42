@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThreadPool, QPoint, Signal
+from PySide6.QtCore import Qt, QThreadPool, QPoint, Signal, QEvent
 from PySide6.QtCore import QFile
 from PySide6.QtGui import QAction, QImage, QKeySequence, QMouseEvent, QMovie
 from PySide6.QtWidgets import (
@@ -103,6 +103,8 @@ class ViewerContainer(QWidget):
         layout.addWidget(self._stack)
         self.setLayout(layout)
         self.setMouseTracking(True)
+        # Intercept mouse moves from viewer regardless of Qt propagation quirks
+        self.viewer.installEventFilter(self)
 
     def show_image_mode(self) -> None:
         self.media_player.stop()
@@ -118,6 +120,13 @@ class ViewerContainer(QWidget):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._reposition_overlays()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.viewer and event.type() == QEvent.Type.MouseMove:
+            if self._stack.currentWidget() is self.viewer:
+                self.overlay.show_bar()
+                self._reposition_overlays()
+        return False
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         if self._stack.currentWidget() is self.viewer:
