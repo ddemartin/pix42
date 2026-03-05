@@ -89,7 +89,9 @@ class ImageLoader:
             MemoryEstimator.estimate_mb(metadata.width, metadata.height),
         )
 
-        preview = self._get_preview(path, decoder)
+        # If full-res is already cached, use it directly to avoid preview→fullres flicker
+        fullres_cached = self._cache.get((str(path), "fullres"))
+        preview = fullres_cached if fullres_cached is not None else self._get_preview(path, decoder)
 
         tiled_provider = None
         if mode == LoadMode.TILED:
@@ -120,6 +122,10 @@ class ImageLoader:
         size_bytes = image.sizeInBytes() if not image.isNull() else 0
         self._cache.put(cache_key, image, size_bytes)
         return image
+
+    def has_fullres(self, path: Path | str) -> bool:
+        """Return True if the full-resolution image is already in cache."""
+        return self._cache.get((str(Path(path)), "fullres")) is not None
 
     def prefetch(self, path: Path | str) -> None:
         """

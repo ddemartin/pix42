@@ -495,7 +495,8 @@ class MainWindow(QMainWindow):
         # Runs for both NORMAL and TILED modes — decode_full caps at 16 K px
         # so memory usage stays bounded even for very large images.
         if (m.width > 0 and m.height > 0
-                and max(m.width, m.height) > self._loader._preview_size):
+                and max(m.width, m.height) > self._loader._preview_size
+                and not self._loader.has_fullres(handle.path)):
             cancel = threading.Event()
             self._fullres_cancel = cancel
             worker = FullResWorker(handle.path, self._loader, cancel)
