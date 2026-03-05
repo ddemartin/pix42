@@ -1,0 +1,13 @@
+# Auto-detect text files and normalize line endings
+* text=auto
+
+# Scripts: keep native line endings
+*.bat text eol=crlf
+*.iss text eol=crlf
+*.sh  text eol=lf
+
+# Binary assets
+*.svg binary
+*.ico binary
+*.png binary
+*.jpg binary
