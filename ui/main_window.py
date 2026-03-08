@@ -52,7 +52,9 @@ def _qimage_to_pil(qimage: QImage):
     from PIL import Image
     qimage = qimage.convertToFormat(QImage.Format.Format_RGB888)
     w, h = qimage.width(), qimage.height()
-    arr = np.frombuffer(qimage.constBits(), dtype=np.uint8).reshape((h, w, 3)).copy()
+    bpl = qimage.bytesPerLine()  # may include padding bytes for 4-byte row alignment
+    arr = np.frombuffer(qimage.constBits(), dtype=np.uint8).reshape((h, bpl))
+    arr = np.ascontiguousarray(arr[:, : w * 3].reshape((h, w, 3)))
     return Image.fromarray(arr, "RGB")
 
 
