@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QRect, QThreadPool, QPoint, Signal, QEvent
+from PySide6.QtCore import Qt, QObject, QRect, QRunnable, QThreadPool, QPoint, QTimer, Signal, QEvent, Slot
 from PySide6.QtCore import QFile
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QMouseEvent, QMovie
 from PySide6.QtWidgets import (
@@ -18,6 +18,7 @@ from core.image_loader import ImageLoader, ImageHandle
 from core.cache_manager import CacheManager
 from models.folder_model import FolderModel, _MEDIA_EXTENSIONS
 from ui.about_dialog import AboutDialog
+from ui.adjust_bar import AdjustBar
 from ui.crop_bar import CropBar
 from ui.settings_dialog import SettingsDialog
 from ui.media_player import MediaPlayer
@@ -37,6 +38,83 @@ _ALWAYS_ANIMATED = frozenset((".gif",))
 _CROPPABLE_SUFFIXES = frozenset({
     ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
 })
+
+# Same set — PIL can both read and write these formats
+_ADJUSTABLE_SUFFIXES = _CROPPABLE_SUFFIXES
+
+
+# ------------------------------------------------------------------ #
+# PIL image-adjustment helpers                                         #
+# ------------------------------------------------------------------ #
+
+def _qimage_to_pil(qimage: QImage):
+    import numpy as np
+    from PIL import Image
+    qimage = qimage.convertToFormat(QImage.Format.Format_RGB888)
+    w, h = qimage.width(), qimage.height()
+    arr = np.frombuffer(qimage.constBits(), dtype=np.uint8).reshape((h, w, 3)).copy()
+    return Image.fromarray(arr, "RGB")
+
+
+def _pil_to_qimage(pil_img) -> QImage:
+    import numpy as np
+    from PIL import Image
+    rgb = pil_img.convert("RGB")
+    arr = np.ascontiguousarray(rgb)
+    h, w, ch = arr.shape
+    return QImage(arr.data, w, h, w * ch, QImage.Format.Format_RGB888).copy()
+
+
+def _apply_adjustments(pil_img, brightness: int, contrast: int,
+                       gamma_slider: int, saturation: int):
+    """Apply adjustments to a PIL Image and return the modified copy.
+
+    brightness, contrast, saturation: -100..+100 (0 = no change)
+    gamma_slider: 10..300 (100 = gamma 1.0, no change)
+    """
+    from PIL import ImageEnhance
+    img = pil_img.convert("RGB")
+    if brightness != 0:
+        img = ImageEnhance.Brightness(img).enhance(max(0.0, 1.0 + brightness / 100.0))
+    if contrast != 0:
+        img = ImageEnhance.Contrast(img).enhance(max(0.01, 1.0 + contrast / 100.0))
+    if gamma_slider != 100:
+        gamma = gamma_slider / 100.0
+        inv_g = 1.0 / gamma
+        lut = [min(255, int((i / 255.0) ** inv_g * 255 + 0.5)) for i in range(256)]
+        img = img.point(lut * 3)
+    if saturation != 0:
+        img = ImageEnhance.Color(img).enhance(max(0.0, 1.0 + saturation / 100.0))
+    return img
+
+
+# ------------------------------------------------------------------ #
+# Adjustment background worker                                         #
+# ------------------------------------------------------------------ #
+
+class _AdjustSignals(QObject):
+    done = Signal(int, QImage)  # (sequence, result)
+
+
+class _AdjustWorker(QRunnable):
+    def __init__(self, pil_img, params: tuple, seq: int) -> None:
+        super().__init__()
+        self._pil    = pil_img
+        self._params = params
+        self._seq    = seq
+        self.signals = _AdjustSignals()
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = _apply_adjustments(self._pil, *self._params)
+            qimg   = _pil_to_qimage(result)
+            self.signals.done.emit(self._seq, qimg)
+        except RuntimeError:
+            pass
+        except Exception:
+            pass
 
 
 def _is_animated(path: Path) -> bool:
@@ -83,8 +161,10 @@ class ViewerContainer(QWidget):
         self.navigator    = NavigatorWidget(self)
         self.spinner      = SpinnerWidget(self)
         self.crop_bar     = CropBar(self)
+        self.adjust_bar   = AdjustBar(self)
         self.overlay.hide()
         self.crop_bar.hide()
+        self.adjust_bar.hide()
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self.viewer)       # index 0
@@ -168,6 +248,11 @@ class ViewerContainer(QWidget):
             cw = self.crop_bar.sizeHint().width()
             ch = self.crop_bar.sizeHint().height()
             self.crop_bar.setGeometry((self.width() - cw) // 2, m, cw, ch)
+        # AdjustBar — top-centre (only when visible)
+        if self.adjust_bar.isVisible():
+            aw = max(self.adjust_bar.sizeHint().width(), min(480, self.width() - 40))
+            ah = self.adjust_bar.sizeHint().height()
+            self.adjust_bar.setGeometry((self.width() - aw) // 2, m, aw, ah)
 
 
 class MainWindow(QMainWindow):
@@ -205,6 +290,16 @@ class MainWindow(QMainWindow):
         self._thumbnails_loaded: bool = False
         self._tray_available: bool = False
         self._crop_mode_active: bool = False
+        self._adjust_mode_active: bool = False
+        self._adjust_original_qimage: Optional[QImage] = None
+        self._adjust_preview_pil = None   # PIL.Image of displayed frame
+        self._adjust_seq: int = 0         # stale-result guard
+        # 1-thread pool for adjustment workers (separate from preview/fullres)
+        self._adjust_pool = QThreadPool()
+        self._adjust_pool.setMaxThreadCount(1)
+        self._adjust_timer = QTimer(self)
+        self._adjust_timer.setSingleShot(True)
+        self._adjust_timer.timeout.connect(self._dispatch_adjust)
         self._app = None  # set by LumaApp after construction
 
         self.setWindowTitle("Luma Viewer")
@@ -370,6 +465,11 @@ class MainWindow(QMainWindow):
         self._act_crop.setEnabled(False)
         self._act_crop.triggered.connect(self._enter_crop_mode)
         edit_menu.addAction(self._act_crop)
+        self._act_adjust = QAction("&Adjust…", self)
+        self._act_adjust.setShortcut(QKeySequence("A"))
+        self._act_adjust.setEnabled(False)
+        self._act_adjust.triggered.connect(self._enter_adjust_mode)
+        edit_menu.addAction(self._act_adjust)
         edit_menu.addSeparator()
         settings_act = QAction("&Settings…", self)
         settings_act.setShortcut(QKeySequence("Ctrl+,"))
@@ -477,6 +577,8 @@ class MainWindow(QMainWindow):
     def _load_current(self) -> None:
         if self._crop_mode_active:
             self._exit_crop_mode()
+        if self._adjust_mode_active:
+            self._exit_adjust_mode()
         entry = self._folder_model.current
         if entry is None:
             return
@@ -511,6 +613,7 @@ class MainWindow(QMainWindow):
         animated = _is_animated(handle.path)
         suffix = handle.path.suffix.lower()
         self._act_crop.setEnabled(suffix in _CROPPABLE_SUFFIXES and not animated)
+        self._act_adjust.setEnabled(suffix in _ADJUSTABLE_SUFFIXES and not animated)
         if handle.preview and not handle.preview.isNull():
             self._container.viewer.set_native_size(m.width, m.height)
             if animated:
@@ -841,6 +944,127 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Crop Failed", str(exc))
 
+    # ------------------------------------------------------------------ #
+    # Adjust                                                               #
+    # ------------------------------------------------------------------ #
+
+    def _enter_adjust_mode(self) -> None:
+        if self._current_handle is None or self._adjust_mode_active:
+            return
+        viewer = self._container.viewer
+        if viewer._image is None or viewer._image.isNull():
+            return
+        self._adjust_mode_active = True
+        self._adjust_seq = 0
+        self._adjust_original_qimage = viewer._image
+        self._adjust_preview_pil = _qimage_to_pil(viewer._image)
+
+        adjust_bar = self._container.adjust_bar
+        suffix = self._current_handle.path.suffix.lower()
+        adjust_bar.set_overwrite_allowed(suffix in _ADJUSTABLE_SUFFIXES)
+        adjust_bar.show()
+        adjust_bar.raise_()
+        self._container._reposition_overlays()
+        self._container.overlay.hide()
+
+        adjust_bar.params_changed.connect(self._on_adjust_params_changed)
+        adjust_bar.cancel_requested.connect(self._exit_adjust_mode)
+        adjust_bar.save_as_requested.connect(self._on_adjust_save_as)
+        adjust_bar.overwrite_requested.connect(self._on_adjust_overwrite)
+
+    def _exit_adjust_mode(self, *, restore: bool = True) -> None:
+        if not self._adjust_mode_active:
+            return
+        self._adjust_mode_active = False
+        self._adjust_timer.stop()
+        adjust_bar = self._container.adjust_bar
+        adjust_bar.hide()
+        try:
+            adjust_bar.params_changed.disconnect(self._on_adjust_params_changed)
+            adjust_bar.cancel_requested.disconnect(self._exit_adjust_mode)
+            adjust_bar.save_as_requested.disconnect(self._on_adjust_save_as)
+            adjust_bar.overwrite_requested.disconnect(self._on_adjust_overwrite)
+        except RuntimeError:
+            pass
+        if restore and self._adjust_original_qimage is not None:
+            self._container.viewer.set_preview(self._adjust_original_qimage)
+        self._adjust_original_qimage = None
+        self._adjust_preview_pil = None
+
+    def _on_adjust_params_changed(self) -> None:
+        self._adjust_timer.start(120)  # debounce 120 ms
+
+    def _dispatch_adjust(self) -> None:
+        if not self._adjust_mode_active or self._adjust_preview_pil is None:
+            return
+        self._adjust_seq += 1
+        seq    = self._adjust_seq
+        params = self._container.adjust_bar.get_params()
+        worker = _AdjustWorker(self._adjust_preview_pil, params, seq)
+        worker.signals.done.connect(self._on_adjust_result)
+        self._adjust_pool.start(worker)
+
+    def _on_adjust_result(self, seq: int, qimage: QImage) -> None:
+        if seq != self._adjust_seq or not self._adjust_mode_active:
+            return
+        self._container.viewer.set_preview(qimage)
+
+    def _on_adjust_save_as(self) -> None:
+        if self._current_handle is None or self._container.adjust_bar.is_identity():
+            return
+        path   = self._current_handle.path
+        suffix = path.suffix.lower()
+        fmt_filters = {
+            ".jpg":  "JPEG (*.jpg *.jpeg)",
+            ".jpeg": "JPEG (*.jpg *.jpeg)",
+            ".png":  "PNG (*.png)",
+            ".bmp":  "BMP (*.bmp)",
+            ".tif":  "TIFF (*.tif *.tiff)",
+            ".tiff": "TIFF (*.tif *.tiff)",
+            ".webp": "WebP (*.webp)",
+        }
+        default_filter = fmt_filters.get(suffix, "PNG (*.png)")
+        all_filter = "All images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
+        default_path = str(path.parent / (path.stem + "_adjusted" + path.suffix))
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Adjusted Image", default_path,
+            f"{default_filter};;{all_filter}",
+        )
+        if out_path:
+            self._save_adjusted(Path(out_path))
+
+    def _on_adjust_overwrite(self) -> None:
+        if self._current_handle is None:
+            return
+        self._save_adjusted(self._current_handle.path, invalidate=True)
+
+    def _save_adjusted(self, dest: Path, *, invalidate: bool = False) -> None:
+        from PIL import Image
+        try:
+            src    = self._current_handle.path
+            params = self._container.adjust_bar.get_params()
+            with Image.open(src) as img:
+                result = _apply_adjustments(img, *params)
+                kwargs: dict = {}
+                suffix = dest.suffix.lower()
+                if suffix in (".jpg", ".jpeg"):
+                    kwargs["quality"] = 95
+                    exif = img.info.get("exif")
+                    if exif:
+                        kwargs["exif"] = exif
+                elif suffix in (".tif", ".tiff"):
+                    kwargs["compression"] = "tiff_lzw"
+                result.save(dest, **kwargs)
+            if invalidate:
+                self._cache.invalidate(src)
+                self._exit_adjust_mode(restore=False)
+                self._load_current()
+            else:
+                self._exit_adjust_mode(restore=False)
+            self._status_bar.showMessage(f"Saved: {dest.name}", 4000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Adjust Failed", str(exc))
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, self._container.viewer, self, app=self._app)
         dlg.exec()
@@ -868,6 +1092,8 @@ class MainWindow(QMainWindow):
         elif key == Qt.Key.Key_Escape:
             if self._crop_mode_active:
                 self._exit_crop_mode()
+            elif self._adjust_mode_active:
+                self._exit_adjust_mode()
             elif self.isFullScreen():
                 self.showNormal()
         else:

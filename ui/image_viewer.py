@@ -134,6 +134,11 @@ class ImageViewer(QWidget):
     # Crop mode                                                            #
     # ------------------------------------------------------------------ #
 
+    def set_preview(self, image: QImage) -> None:
+        """Swap the displayed image without touching zoom/pan (live preview use)."""
+        self._image = image
+        self.update()
+
     def set_crop_mode(self, enabled: bool) -> None:
         """Enter or exit rubber-band crop mode."""
         self._crop_mode = enabled
