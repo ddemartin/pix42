@@ -6,7 +6,7 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThreadPool, QPoint, Signal, QEvent
+from PySide6.QtCore import Qt, QRect, QThreadPool, QPoint, Signal, QEvent
 from PySide6.QtCore import QFile
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QMouseEvent, QMovie
 from PySide6.QtWidgets import (
@@ -18,6 +18,7 @@ from core.image_loader import ImageLoader, ImageHandle
 from core.cache_manager import CacheManager
 from models.folder_model import FolderModel, _MEDIA_EXTENSIONS
 from ui.about_dialog import AboutDialog
+from ui.crop_bar import CropBar
 from ui.settings_dialog import SettingsDialog
 from ui.media_player import MediaPlayer
 from ui.image_viewer import ImageViewer
@@ -32,6 +33,10 @@ log = logging.getLogger(__name__)
 
 
 _ALWAYS_ANIMATED = frozenset((".gif",))
+
+_CROPPABLE_SUFFIXES = frozenset({
+    ".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
+})
 
 
 def _is_animated(path: Path) -> bool:
@@ -77,7 +82,9 @@ class ViewerContainer(QWidget):
         self.overlay      = OverlayBar(self)
         self.navigator    = NavigatorWidget(self)
         self.spinner      = SpinnerWidget(self)
+        self.crop_bar     = CropBar(self)
         self.overlay.hide()
+        self.crop_bar.hide()
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self.viewer)       # index 0
@@ -156,6 +163,11 @@ class ViewerContainer(QWidget):
         sw = self.spinner.width()
         sh = self.spinner.height()
         self.spinner.setGeometry(self.width() - sw - m, self.height() - sh - m, sw, sh)
+        # CropBar — top-centre (only when visible)
+        if self.crop_bar.isVisible():
+            cw = self.crop_bar.sizeHint().width()
+            ch = self.crop_bar.sizeHint().height()
+            self.crop_bar.setGeometry((self.width() - cw) // 2, m, cw, ch)
 
 
 class MainWindow(QMainWindow):
@@ -192,6 +204,7 @@ class MainWindow(QMainWindow):
         self._current_handle: Optional[ImageHandle] = None
         self._thumbnails_loaded: bool = False
         self._tray_available: bool = False
+        self._crop_mode_active: bool = False
         self._app = None  # set by LumaApp after construction
 
         self.setWindowTitle("Luma Viewer")
@@ -352,6 +365,12 @@ class MainWindow(QMainWindow):
 
         # Edit
         edit_menu = mb.addMenu("&Edit")
+        self._act_crop = QAction("&Crop…", self)
+        self._act_crop.setShortcut(QKeySequence("C"))
+        self._act_crop.setEnabled(False)
+        self._act_crop.triggered.connect(self._enter_crop_mode)
+        edit_menu.addAction(self._act_crop)
+        edit_menu.addSeparator()
         settings_act = QAction("&Settings…", self)
         settings_act.setShortcut(QKeySequence("Ctrl+,"))
         settings_act.triggered.connect(self._open_settings)
@@ -456,6 +475,8 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _load_current(self) -> None:
+        if self._crop_mode_active:
+            self._exit_crop_mode()
         entry = self._folder_model.current
         if entry is None:
             return
@@ -488,6 +509,8 @@ class MainWindow(QMainWindow):
         self._current_handle = handle
         m = handle.metadata
         animated = _is_animated(handle.path)
+        suffix = handle.path.suffix.lower()
+        self._act_crop.setEnabled(suffix in _CROPPABLE_SUFFIXES and not animated)
         if handle.preview and not handle.preview.isNull():
             self._container.viewer.set_native_size(m.width, m.height)
             if animated:
@@ -719,6 +742,105 @@ class MainWindow(QMainWindow):
             self._lbl_dims.setText("")
             self._lbl_zoom.setText("")
 
+    # ------------------------------------------------------------------ #
+    # Crop                                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _enter_crop_mode(self) -> None:
+        if self._current_handle is None or self._crop_mode_active:
+            return
+        self._crop_mode_active = True
+        viewer   = self._container.viewer
+        crop_bar = self._container.crop_bar
+        suffix = self._current_handle.path.suffix.lower()
+        crop_bar.set_overwrite_allowed(suffix in _CROPPABLE_SUFFIXES)
+        crop_bar.clear_selection()
+        crop_bar.show()
+        crop_bar.raise_()
+        self._container._reposition_overlays()
+        self._container.overlay.hide()
+        viewer.set_crop_mode(True)
+        viewer.crop_selection_changed.connect(self._on_crop_selection)
+        crop_bar.cancel_requested.connect(self._exit_crop_mode)
+        crop_bar.save_as_requested.connect(self._on_crop_save_as)
+        crop_bar.overwrite_requested.connect(self._on_crop_overwrite)
+
+    def _exit_crop_mode(self) -> None:
+        if not self._crop_mode_active:
+            return
+        self._crop_mode_active = False
+        viewer   = self._container.viewer
+        crop_bar = self._container.crop_bar
+        viewer.set_crop_mode(False)
+        crop_bar.hide()
+        try:
+            viewer.crop_selection_changed.disconnect(self._on_crop_selection)
+            crop_bar.cancel_requested.disconnect(self._exit_crop_mode)
+            crop_bar.save_as_requested.disconnect(self._on_crop_save_as)
+            crop_bar.overwrite_requested.disconnect(self._on_crop_overwrite)
+        except RuntimeError:
+            pass
+
+    def _on_crop_selection(self, w: int, h: int) -> None:
+        self._container.crop_bar.update_selection(w, h)
+
+    def _on_crop_save_as(self) -> None:
+        rect = self._container.viewer.get_crop_rect()
+        if rect is None or self._current_handle is None:
+            return
+        path = self._current_handle.path
+        suffix = path.suffix.lower()
+        fmt_filters = {
+            ".jpg":  "JPEG (*.jpg *.jpeg)",
+            ".jpeg": "JPEG (*.jpg *.jpeg)",
+            ".png":  "PNG (*.png)",
+            ".bmp":  "BMP (*.bmp)",
+            ".tif":  "TIFF (*.tif *.tiff)",
+            ".tiff": "TIFF (*.tif *.tiff)",
+            ".webp": "WebP (*.webp)",
+        }
+        default_filter = fmt_filters.get(suffix, "PNG (*.png)")
+        all_filter = "All images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)"
+        filters = f"{default_filter};;{all_filter}"
+        default_path = str(path.parent / (path.stem + "_crop" + path.suffix))
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Cropped Image", default_path, filters
+        )
+        if out_path:
+            self._save_crop(Path(out_path), rect)
+
+    def _on_crop_overwrite(self) -> None:
+        rect = self._container.viewer.get_crop_rect()
+        if rect is None or self._current_handle is None:
+            return
+        self._save_crop(self._current_handle.path, rect, invalidate=True)
+
+    def _save_crop(self, dest: Path, rect: QRect, *, invalidate: bool = False) -> None:
+        from PIL import Image
+        try:
+            src = self._current_handle.path
+            with Image.open(src) as img:
+                box = (rect.x(), rect.y(), rect.x() + rect.width(), rect.y() + rect.height())
+                cropped = img.crop(box)
+                kwargs: dict = {}
+                suffix = dest.suffix.lower()
+                if suffix in (".jpg", ".jpeg"):
+                    kwargs["quality"] = 95
+                    exif = img.info.get("exif")
+                    if exif:
+                        kwargs["exif"] = exif
+                elif suffix in (".tif", ".tiff"):
+                    kwargs["compression"] = "tiff_lzw"
+                cropped.save(dest, **kwargs)
+            if invalidate:
+                self._cache.invalidate(src)
+                self._load_current()
+            else:
+                self._exit_crop_mode()
+            self._status_bar.showMessage(f"Saved: {dest.name}", 4000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Crop Failed", str(exc))
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, self._container.viewer, self, app=self._app)
         dlg.exec()
@@ -743,7 +865,10 @@ class MainWindow(QMainWindow):
             self._delete_current_file()
         elif key == Qt.Key.Key_F11:
             self._toggle_fullscreen()
-        elif key == Qt.Key.Key_Escape and self.isFullScreen():
-            self.showNormal()
+        elif key == Qt.Key.Key_Escape:
+            if self._crop_mode_active:
+                self._exit_crop_mode()
+            elif self.isFullScreen():
+                self.showNormal()
         else:
             super().keyPressEvent(event)

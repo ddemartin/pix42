@@ -4,10 +4,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from PySide6.QtCore import Qt, QPoint, QPointF, QRectF, QSize, Signal
+from PySide6.QtCore import Qt, QPoint, QPointF, QRect, QRectF, QSize, Signal
 from PySide6.QtGui import (
     QAction, QImage, QKeyEvent, QMouseEvent, QMovie, QPainter, QPainterPath,
-    QWheelEvent, QResizeEvent, QColor, QBrush,
+    QPen, QWheelEvent, QResizeEvent, QColor, QBrush,
 )
 from PySide6.QtWidgets import QMenu, QWidget
 
@@ -35,6 +35,7 @@ class ImageViewer(QWidget):
     zoom_changed = Signal(float)
     pan_changed = Signal()
     delete_requested = Signal()
+    crop_selection_changed = Signal(int, int)  # w, h in image pixels (0,0 = cleared)
 
     ZOOM_STEP = 1.25
     ZOOM_MIN = 0.02
@@ -54,6 +55,10 @@ class ImageViewer(QWidget):
         self._stretch_small: bool = True
         self._movie: Optional[QMovie] = None
         self._bg_color: QColor = QColor(30, 30, 30)
+
+        self._crop_mode: bool = False
+        self._crop_start: Optional[QPoint] = None
+        self._crop_rect_w: Optional[QRect] = None  # selection in widget coords
 
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(QSize(200, 200))
@@ -124,6 +129,39 @@ class ImageViewer(QWidget):
     def set_backdrop_color(self, color: QColor) -> None:
         self._bg_color = color
         self.update()
+
+    # ------------------------------------------------------------------ #
+    # Crop mode                                                            #
+    # ------------------------------------------------------------------ #
+
+    def set_crop_mode(self, enabled: bool) -> None:
+        """Enter or exit rubber-band crop mode."""
+        self._crop_mode = enabled
+        if not enabled:
+            self._crop_start = None
+            self._crop_rect_w = None
+        self.setCursor(
+            Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor
+        )
+        self.update()
+
+    def get_crop_rect(self) -> Optional[QRect]:
+        """Return the current selection in image-pixel coordinates, or None."""
+        if self._crop_rect_w is None or self._image is None or self._image.isNull():
+            return None
+        zoom = self._render_zoom()
+        if zoom == 0.0:
+            return None
+        r = self._crop_rect_w
+        iw, ih = self._image.width(), self._image.height()
+        x1 = max(0.0, (r.left()   - self._offset.x()) / zoom)
+        y1 = max(0.0, (r.top()    - self._offset.y()) / zoom)
+        x2 = min(float(iw), (r.right()  + 1 - self._offset.x()) / zoom)
+        y2 = min(float(ih), (r.bottom() + 1 - self._offset.y()) / zoom)
+        w, h = int(x2 - x1), int(y2 - y1)
+        if w < 1 or h < 1:
+            return None
+        return QRect(int(x1), int(y1), w, h)
 
     def set_fit_mode(self) -> None:
         """Scale image to fill the viewport."""
@@ -219,6 +257,26 @@ class ImageViewer(QWidget):
         source = QRectF(0, 0, self._image.width(), self._image.height())
         painter.drawImage(target, self._image, source)
 
+        if self._crop_mode:
+            self._paint_crop_overlay(painter)
+
+    def _paint_crop_overlay(self, painter: QPainter) -> None:
+        if self._crop_rect_w is not None:
+            # Dim area outside selection
+            outer = QPainterPath()
+            outer.addRect(QRectF(self.rect()))
+            inner = QPainterPath()
+            inner.addRect(QRectF(self._crop_rect_w))
+            painter.fillPath(outer.subtracted(inner), QColor(0, 0, 0, 110))
+            # Dashed white border
+            pen = QPen(QColor(255, 255, 255, 200), 1.0)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(self._crop_rect_w)
+        else:
+            # Hint overlay: slight dim + crosshair cursor hint
+            painter.fillRect(self.rect(), QColor(0, 0, 0, 40))
+
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
         if delta == 0:
@@ -229,10 +287,22 @@ class ImageViewer(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._last_mouse = event.pos()
+            if self._crop_mode:
+                self._crop_start = event.pos()
+                self._crop_rect_w = QRect(event.pos(), event.pos())
+                self.update()
+            else:
+                self._last_mouse = event.pos()
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self._last_mouse is not None and event.buttons() & Qt.MouseButton.LeftButton:
+        if self._crop_mode:
+            if self._crop_start is not None and event.buttons() & Qt.MouseButton.LeftButton:
+                self._crop_rect_w = QRect(self._crop_start, event.pos()).normalized()
+                self.update()
+                r = self.get_crop_rect()
+                if r:
+                    self.crop_selection_changed.emit(r.width(), r.height())
+        elif self._last_mouse is not None and event.buttons() & Qt.MouseButton.LeftButton:
             delta = event.pos() - self._last_mouse
             self._offset += QPointF(delta.x(), delta.y())
             self._last_mouse = event.pos()
@@ -243,7 +313,10 @@ class ImageViewer(QWidget):
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._last_mouse = None
+            if self._crop_mode:
+                self._crop_start = None
+            else:
+                self._last_mouse = None
 
     def contextMenuEvent(self, event) -> None:
         if self._image is None or self._image.isNull():
