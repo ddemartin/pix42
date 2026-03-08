@@ -178,20 +178,42 @@ class PillowDecoder(BaseDecoder):
         if path.suffix.lower() in (".tif", ".tiff"):
             quick = _tiff_quick_preview(path, max_size)
             if quick is not None:
-                quick = _normalize_mode(quick)
-                quick.thumbnail((max_size, max_size), Image.LANCZOS)
-                return _pil_to_qimage(quick)
+                try:
+                    quick = _normalize_mode(quick)
+                    quick.thumbnail((max_size, max_size), Image.LANCZOS)
+                    return _pil_to_qimage(quick)
+                except MemoryError:
+                    pass
 
-        with Image.open(path) as img:
-            # draft() must be called before any pixel access to take effect (JPEG sub-sampling)
-            img.draft("RGB", (max_size, max_size))
+        try:
+            with Image.open(path) as img:
+                # draft() must be called before any pixel access (enables JPEG sub-sampling)
+                img.draft("RGB", (max_size, max_size))
+                try:
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                # For images wider/taller than 2× the target, try an integer pre-reduction
+                # before the numpy path to lower peak memory usage.
+                factor = max(img.width, img.height) // max_size // 2
+                if factor >= 2:
+                    try:
+                        img = img.reduce(factor)
+                    except (MemoryError, Exception):
+                        pass
+                img = _normalize_mode(img)
+                img.thumbnail((max_size, max_size), Image.LANCZOS)
+                return _pil_to_qimage(img)
+        except MemoryError:
             try:
-                img = ImageOps.exif_transpose(img)
-            except Exception:
-                pass
-            img = _normalize_mode(img)
-            img.thumbnail((max_size, max_size), Image.LANCZOS)
-            return _pil_to_qimage(img)
+                size_mb = path.stat().st_size >> 20
+                size_str = f" ({size_mb} MB on disk)"
+            except OSError:
+                size_str = ""
+            raise MemoryError(
+                f"{path.name}: not enough RAM to load{size_str}. "
+                "The image has no embedded overview — a full decode is required."
+            )
 
     def decode_region(self, path: Path, region: Region, scale: float) -> QImage:
         if not _PILLOW_AVAILABLE:
