@@ -23,6 +23,7 @@ from db.thumbnail_store import ThumbnailStore
 from models.folder_model import FolderModel, _MEDIA_EXTENSIONS, _AUDIO_EXTENSIONS
 from ui.about_dialog import AboutDialog
 from ui.adjust_bar import AdjustBar
+from ui.rotate_bar import RotateBar
 from ui.crop_bar import CropBar
 from ui.settings_dialog import SettingsDialog
 from ui.media_player import MediaPlayer
@@ -45,6 +46,9 @@ _CROPPABLE_SUFFIXES = frozenset({
 
 # Same set — PIL can both read and write these formats
 _ADJUSTABLE_SUFFIXES = _CROPPABLE_SUFFIXES
+
+# Rotation works for all PIL-writable formats plus animated GIF
+_ROTATABLE_SUFFIXES = _CROPPABLE_SUFFIXES | frozenset({".gif"})
 
 
 # ------------------------------------------------------------------ #
@@ -168,9 +172,11 @@ class ViewerContainer(QWidget):
         self.spinner      = SpinnerWidget(self)
         self.crop_bar     = CropBar(self)
         self.adjust_bar   = AdjustBar(self)
+        self.rotate_bar   = RotateBar(self)
         self.overlay.hide()
         self.crop_bar.hide()
         self.adjust_bar.hide()
+        self.rotate_bar.hide()
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self.viewer)       # index 0
@@ -259,6 +265,11 @@ class ViewerContainer(QWidget):
             aw = max(self.adjust_bar.sizeHint().width(), min(480, self.width() - 40))
             ah = self.adjust_bar.sizeHint().height()
             self.adjust_bar.setGeometry((self.width() - aw) // 2, m, aw, ah)
+        # RotateBar — top-centre (only when visible)
+        if self.rotate_bar.isVisible():
+            rw = self.rotate_bar.sizeHint().width()
+            rh = self.rotate_bar.sizeHint().height()
+            self.rotate_bar.setGeometry((self.width() - rw) // 2, m, rw, rh)
 
 
 class MainWindow(QMainWindow):
@@ -303,6 +314,7 @@ class MainWindow(QMainWindow):
         self._tray_available: bool = False
         self._crop_mode_active: bool = False
         self._adjust_mode_active: bool = False
+        self._rotate_mode_active: bool = False
         self._adjust_original_qimage: Optional[QImage] = None
         self._adjust_preview_pil = None   # PIL.Image of displayed frame
         self._adjust_seq: int = 0         # stale-result guard
@@ -496,6 +508,11 @@ class MainWindow(QMainWindow):
         self._act_adjust.setEnabled(False)
         self._act_adjust.triggered.connect(self._enter_adjust_mode)
         edit_menu.addAction(self._act_adjust)
+        self._act_rotate = QAction("&Rotate…", self)
+        self._act_rotate.setShortcut(QKeySequence("R"))
+        self._act_rotate.setEnabled(False)
+        self._act_rotate.triggered.connect(self._enter_rotate_mode)
+        edit_menu.addAction(self._act_rotate)
         edit_menu.addSeparator()
         settings_act = QAction("&Settings…", self)
         settings_act.setShortcut(QKeySequence("Ctrl+,"))
@@ -606,6 +623,8 @@ class MainWindow(QMainWindow):
             self._exit_crop_mode()
         if self._adjust_mode_active:
             self._exit_adjust_mode()
+        if self._rotate_mode_active:
+            self._exit_rotate_mode()
         entry = self._folder_model.current
         if entry is None:
             return
@@ -641,6 +660,7 @@ class MainWindow(QMainWindow):
         suffix = handle.path.suffix.lower()
         self._act_crop.setEnabled(suffix in _CROPPABLE_SUFFIXES and not animated)
         self._act_adjust.setEnabled(suffix in _ADJUSTABLE_SUFFIXES and not animated)
+        self._act_rotate.setEnabled(suffix in _ROTATABLE_SUFFIXES)
         if handle.preview and not handle.preview.isNull():
             self._container.viewer.set_native_size(m.width, m.height)
             if animated:
@@ -1131,6 +1151,143 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Adjust Failed", str(exc))
 
+    # ------------------------------------------------------------------ #
+    # Rotate                                                               #
+    # ------------------------------------------------------------------ #
+
+    def _enter_rotate_mode(self) -> None:
+        if self._current_handle is None or self._rotate_mode_active:
+            return
+        suffix = self._current_handle.path.suffix.lower()
+        if suffix not in _ROTATABLE_SUFFIXES:
+            return
+        self._rotate_mode_active = True
+        rotate_bar = self._container.rotate_bar
+        rotate_bar.set_overwrite_allowed(True)
+        rotate_bar.update_angle(0)
+        self._container.viewer.set_rotation(0)
+        rotate_bar.show()
+        rotate_bar.raise_()
+        self._container._reposition_overlays()
+        self._container.overlay.hide()
+        rotate_bar.rotate_ccw_requested.connect(self._on_rotate_ccw)
+        rotate_bar.rotate_cw_requested.connect(self._on_rotate_cw)
+        rotate_bar.cancel_requested.connect(self._exit_rotate_mode)
+        rotate_bar.save_as_requested.connect(self._on_rotate_save_as)
+        rotate_bar.overwrite_requested.connect(self._on_rotate_overwrite)
+
+    def _exit_rotate_mode(self) -> None:
+        if not self._rotate_mode_active:
+            return
+        self._rotate_mode_active = False
+        rotate_bar = self._container.rotate_bar
+        rotate_bar.hide()
+        self._container.viewer.set_rotation(0)
+        try:
+            rotate_bar.rotate_ccw_requested.disconnect(self._on_rotate_ccw)
+            rotate_bar.rotate_cw_requested.disconnect(self._on_rotate_cw)
+            rotate_bar.cancel_requested.disconnect(self._exit_rotate_mode)
+            rotate_bar.save_as_requested.disconnect(self._on_rotate_save_as)
+            rotate_bar.overwrite_requested.disconnect(self._on_rotate_overwrite)
+        except RuntimeError:
+            pass
+
+    def _on_rotate_ccw(self) -> None:
+        viewer = self._container.viewer
+        new_rot = (viewer.get_rotation() - 90) % 360
+        viewer.set_rotation(new_rot)
+        self._container.rotate_bar.update_angle(new_rot)
+
+    def _on_rotate_cw(self) -> None:
+        viewer = self._container.viewer
+        new_rot = (viewer.get_rotation() + 90) % 360
+        viewer.set_rotation(new_rot)
+        self._container.rotate_bar.update_angle(new_rot)
+
+    def _on_rotate_save_as(self) -> None:
+        if self._current_handle is None:
+            return
+        path   = self._current_handle.path
+        suffix = path.suffix.lower()
+        fmt_filters = {
+            ".jpg":  "JPEG (*.jpg *.jpeg)",
+            ".jpeg": "JPEG (*.jpg *.jpeg)",
+            ".png":  "PNG (*.png)",
+            ".bmp":  "BMP (*.bmp)",
+            ".tif":  "TIFF (*.tif *.tiff)",
+            ".tiff": "TIFF (*.tif *.tiff)",
+            ".webp": "WebP (*.webp)",
+            ".gif":  "GIF (*.gif)",
+        }
+        default_filter = fmt_filters.get(suffix, "PNG (*.png)")
+        all_filter = "All images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif)"
+        default_path = str(path.parent / (path.stem + "_rotated" + path.suffix))
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Rotated Image", default_path,
+            f"{default_filter};;{all_filter}",
+        )
+        if out_path:
+            self._save_rotated(Path(out_path))
+
+    def _on_rotate_overwrite(self) -> None:
+        if self._current_handle is None:
+            return
+        self._save_rotated(self._current_handle.path, invalidate=True)
+
+    def _save_rotated(self, dest: Path, *, invalidate: bool = False) -> None:
+        from PIL import Image
+        rotation = self._container.viewer.get_rotation()
+        if rotation == 0:
+            return
+        src    = self._current_handle.path
+        suffix = src.suffix.lower()
+        try:
+            if suffix == ".gif":
+                self._save_rotated_gif(src, dest, rotation)
+            else:
+                with Image.open(src) as img:
+                    rotated = img.rotate(-rotation, expand=True)
+                    kwargs: dict = {}
+                    out_suffix = dest.suffix.lower()
+                    if out_suffix in (".jpg", ".jpeg"):
+                        kwargs["quality"] = 95
+                        exif = img.info.get("exif")
+                        if exif:
+                            kwargs["exif"] = exif
+                    elif out_suffix in (".tif", ".tiff"):
+                        kwargs["compression"] = "tiff_lzw"
+                    rotated.save(dest, **kwargs)
+            if invalidate:
+                self._container.viewer._stop_movie()
+                self._cache.invalidate(src)
+                self._exit_rotate_mode()
+                self._load_current()
+            else:
+                self._exit_rotate_mode()
+            self._status_bar.showMessage(f"Saved: {dest.name}", 4000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Rotate Failed", str(exc))
+
+    def _save_rotated_gif(self, src: Path, dest: Path, rotation: int) -> None:
+        from PIL import Image
+        with Image.open(src) as pil_img:
+            n_frames = getattr(pil_img, "n_frames", 1)
+            frames: list = []
+            durations: list = []
+            for i in range(n_frames):
+                pil_img.seek(i)
+                frame = pil_img.convert("RGBA")
+                frames.append(frame.rotate(-rotation, expand=True))
+                durations.append(pil_img.info.get("duration", 100))
+        if frames:
+            frames[0].save(
+                dest, format="GIF", save_all=True,
+                append_images=frames[1:],
+                loop=0,
+                duration=durations,
+                disposal=2,
+            )
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, self._container.viewer, self, app=self._app)
         dlg.exec()
@@ -1160,6 +1317,8 @@ class MainWindow(QMainWindow):
                 self._exit_crop_mode()
             elif self._adjust_mode_active:
                 self._exit_adjust_mode()
+            elif self._rotate_mode_active:
+                self._exit_rotate_mode()
             elif self.isFullScreen():
                 self.showNormal()
         else:

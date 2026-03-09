@@ -54,6 +54,7 @@ class ImageViewer(QWidget):
 
         self._stretch_small: bool = True
         self._movie: Optional[QMovie] = None
+        self._rotation: int = 0     # degrees CW: 0 / 90 / 180 / 270
         self._bg_color: QColor = QColor(30, 30, 30)
 
         self._crop_mode: bool = False
@@ -118,6 +119,19 @@ class ImageViewer(QWidget):
         self._stop_movie()
         self._image = None
         self.update()
+
+    def set_rotation(self, degrees: int) -> None:
+        """Set display rotation (0/90/180/270 degrees CW) and refit."""
+        self._rotation = degrees % 360
+        if self._fit_mode:
+            self._recompute_fit()
+        else:
+            self._center_image()
+        self.update()
+
+    def get_rotation(self) -> int:
+        """Return current display rotation in degrees CW."""
+        return self._rotation
 
     def set_stretch_small(self, enabled: bool) -> None:
         """If *enabled*, small images are upscaled to fill the viewport.
@@ -268,12 +282,28 @@ class ImageViewer(QWidget):
             return
 
         zoom = self._render_zoom()
-        scaled_w = self._image.width() * zoom
-        scaled_h = self._image.height() * zoom
+        iw   = self._image.width()
+        ih   = self._image.height()
+        # Display bounding box depends on rotation (90/270 swap w/h)
+        disp_w = ih if self._rotation in (90, 270) else iw
+        disp_h = iw if self._rotation in (90, 270) else ih
 
-        target = QRectF(self._offset.x(), self._offset.y(), scaled_w, scaled_h)
-        source = QRectF(0, 0, self._image.width(), self._image.height())
-        painter.drawImage(target, self._image, source)
+        # Centre of the display bounding box in widget coords
+        cx = self._offset.x() + disp_w * zoom / 2.0
+        cy = self._offset.y() + disp_h * zoom / 2.0
+
+        painter.save()
+        painter.translate(cx, cy)
+        if self._rotation:
+            painter.rotate(self._rotation)
+        hw = iw * zoom / 2.0
+        hh = ih * zoom / 2.0
+        painter.drawImage(
+            QRectF(-hw, -hh, iw * zoom, ih * zoom),
+            self._image,
+            QRectF(0, 0, iw, ih),
+        )
+        painter.restore()
 
         if self._crop_mode:
             self._paint_crop_overlay(painter)
@@ -395,22 +425,26 @@ class ImageViewer(QWidget):
         iw, ih = self._image.width(), self._image.height()
         if iw == 0 or ih == 0:
             return
-        scale = min(vw / iw, vh / ih)
+        # For 90°/270°, the displayed footprint is transposed
+        disp_w = ih if self._rotation in (90, 270) else iw
+        disp_h = iw if self._rotation in (90, 270) else ih
+        scale = min(vw / disp_w, vh / disp_h)
         if not self._stretch_small:
             scale = min(scale, 1.0)
         self._base_scale_fit = scale
         self._center_image()
 
     def _center_image(self) -> None:
-        """Centre the (scaled) image in the viewport."""
+        """Centre the (scaled) image bounding box in the viewport."""
         if self._image is None:
             return
         zoom = self._render_zoom()
-        scaled_w = self._image.width() * zoom
-        scaled_h = self._image.height() * zoom
+        iw, ih = self._image.width(), self._image.height()
+        disp_w = ih if self._rotation in (90, 270) else iw
+        disp_h = iw if self._rotation in (90, 270) else ih
         self._offset = QPointF(
-            (self.width() - scaled_w) / 2.0,
-            (self.height() - scaled_h) / 2.0,
+            (self.width()  - disp_w * zoom) / 2.0,
+            (self.height() - disp_h * zoom) / 2.0,
         )
 
     def _viewport_center(self) -> QPointF:
