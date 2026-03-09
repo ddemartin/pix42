@@ -102,7 +102,11 @@ class LumaApp:
             if self._start_in_tray:
                 self._show_window()
 
-        return self._qapp.exec()
+        ret = self._qapp.exec()
+        # Give active workers (e.g. in-flight ffmpeg subprocesses) up to 3 s
+        # to finish, then return anyway so the Python process can exit cleanly.
+        QThreadPool.globalInstance().waitForDone(3000)
+        return ret
 
     # ------------------------------------------------------------------ #
     # Tray                                                                 #

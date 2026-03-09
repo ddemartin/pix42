@@ -355,12 +355,25 @@ class MainWindow(QMainWindow):
             # Hide to tray instead of quitting
             event.ignore()
             self.hide()
-        else:
-            self._settings.save_geometry(self.saveGeometry())
-            splitter = self.centralWidget()
-            if hasattr(splitter, "saveState"):
-                self._settings.save_splitter_state(splitter.saveState())
-            super().closeEvent(event)
+            return
+        # Cancel all pending background work so threads can exit promptly
+        self._adjust_timer.stop()
+        if self._fullres_cancel is not None:
+            self._fullres_cancel.set()
+        for pool in (
+            self._preview_pool, self._fullres_pool,
+            self._thumb_pool, self._prefetch_pool, self._adjust_pool,
+        ):
+            pool.clear()
+        self._settings.save_geometry(self.saveGeometry())
+        splitter = self.centralWidget()
+        if hasattr(splitter, "saveState"):
+            self._settings.save_splitter_state(splitter.saveState())
+        super().closeEvent(event)
+        # setQuitOnLastWindowClosed(False) is set globally for tray support,
+        # so we must quit the event loop explicitly when actually closing.
+        from PySide6.QtWidgets import QApplication
+        QApplication.quit()
 
     # ------------------------------------------------------------------ #
     # UI construction                                                      #

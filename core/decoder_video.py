@@ -75,7 +75,7 @@ def _extract_frame(path: Path, max_size: int, seek: str | None = "00:00:01") -> 
             "-q:v", "3",
             "-y", tmp.name,
         ]
-        r = subprocess.run(cmd, capture_output=True, timeout=15)
+        r = subprocess.run(cmd, capture_output=True, timeout=5)
         if r.returncode == 0:
             img = QImage(tmp.name)
             if not img.isNull():
