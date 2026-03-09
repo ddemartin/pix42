@@ -149,6 +149,92 @@ def _fmt_size(n_bytes: int) -> str:
     return f"{n_bytes} B"
 
 
+class ExpandedGridOverlay(QWidget):
+    """
+    Full-window thumbnail browser overlay.
+
+    Covers the entire central area when the user clicks the expand button on
+    the filmstrip nav bar. Clicking a thumbnail emits ``image_selected`` and
+    the overlay is dismissed; clicking a folder navigates into it.
+    """
+
+    image_selected  = Signal(Path)
+    folder_selected = Signal(Path)
+    close_requested = Signal()
+    scroll_changed  = Signal()
+
+    def __init__(self, folder_model: FolderModel, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+
+        # Header bar
+        header = QWidget(self)
+        header.setFixedHeight(36)
+        header.setStyleSheet(
+            "background: #252525; border-bottom: 1px solid #3a3a3a;"
+        )
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(8, 4, 8, 4)
+        hl.setSpacing(8)
+
+        self._close_btn = QPushButton("✕", header)
+        self._close_btn.setFixedSize(26, 26)
+        self._close_btn.setToolTip("Close grid view  (Esc)")
+        self._close_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(60,60,60,0.9); color: #bbb;
+                border: 1px solid #555; border-radius: 4px; font-size: 12px;
+            }
+            QPushButton:hover   { background: rgba(180,50,50,0.9); color: #fff; }
+            QPushButton:pressed { background: rgba(200,60,60,0.9); }
+        """)
+        self._close_btn.clicked.connect(self.close_requested)
+
+        self._folder_lbl = QLabel("", header)
+        self._folder_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
+
+        hl.addWidget(self._close_btn)
+        hl.addWidget(self._folder_lbl, stretch=1)
+
+        # Grid
+        self._inner_grid = GridView(folder_model, self)
+        self._inner_grid.image_activated.connect(self.image_selected)
+        self._inner_grid.folder_activated.connect(self.folder_selected)
+        self._inner_grid.scroll_changed.connect(self.scroll_changed)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(header)
+        layout.addWidget(self._inner_grid, stretch=1)
+
+    def refresh(self) -> None:
+        self._inner_grid.refresh()
+
+    def select_path(self, path: Path) -> None:
+        self._inner_grid.select_path(path)
+
+    def set_thumbnail(self, path: Path, image: QImage) -> None:
+        self._inner_grid.set_thumbnail(path, image)
+
+    def get_visible_paths(self) -> list[Path]:
+        return self._inner_grid.get_visible_paths()
+
+    def set_folder_label(self, text: str, tooltip: str = "") -> None:
+        self._folder_lbl.setText(text)
+        self._folder_lbl.setToolTip(tooltip)
+
+    def paintEvent(self, event) -> None:
+        from PySide6.QtGui import QPainter
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(18, 18, 18))
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_requested.emit()
+        else:
+            super().keyPressEvent(event)
+
+
 class ViewerContainer(QWidget):
     """
     Wrapper that holds ImageViewer + OverlayBar + NavigatorWidget overlaid.
@@ -420,8 +506,12 @@ class MainWindow(QMainWindow):
         self._nav_up_btn.setEnabled(False)
         self._nav_label = QLabel("")
         self._nav_label.setStyleSheet("color: #aaa; font-size: 11px;")
+        self._nav_expand_btn = QPushButton("⊞")
+        self._nav_expand_btn.setFixedSize(22, 22)
+        self._nav_expand_btn.setToolTip("Open full-window thumbnail browser")
         nav_layout.addWidget(self._nav_up_btn)
         nav_layout.addWidget(self._nav_label, stretch=1)
+        nav_layout.addWidget(self._nav_expand_btn)
         left_layout.addWidget(nav_bar)
 
         self._grid = GridView(self._folder_model, left)
@@ -442,6 +532,10 @@ class MainWindow(QMainWindow):
         left.hide()
 
         self.setCentralWidget(splitter)
+
+        # ---- expanded grid overlay (child of MainWindow, covers central widget) ----
+        self._expanded_overlay = ExpandedGridOverlay(self._folder_model, self)
+        self._expanded_overlay.hide()
 
         # ---- status bar ----
         self._status_bar = QStatusBar()
@@ -545,11 +639,16 @@ class MainWindow(QMainWindow):
         self._grid.folder_activated.connect(self._open_folder)
         self._grid.scroll_changed.connect(self._reprioritize_thumbnails)
         self._nav_up_btn.clicked.connect(self._go_up)
+        self._nav_expand_btn.clicked.connect(self._open_expanded_grid)
         self._container.navigator.pan_requested.connect(self._on_navigator_pan)
         self._container.toggle_filmstrip.connect(self._toggle_filmstrip)
         self._container.media_player.error_occurred.connect(
             lambda msg: self._status_bar.showMessage(f"Media error: {msg}", 5000)
         )
+        self._expanded_overlay.image_selected.connect(self._on_expanded_image_selected)
+        self._expanded_overlay.folder_selected.connect(self._on_expanded_folder_selected)
+        self._expanded_overlay.close_requested.connect(self._close_expanded_grid)
+        self._expanded_overlay.scroll_changed.connect(self._reprioritize_thumbnails_expanded)
 
     # ------------------------------------------------------------------ #
     # File opening                                                         #
@@ -796,6 +895,7 @@ class MainWindow(QMainWindow):
 
     def _on_thumbnail_ready(self, path: Path, image: QImage) -> None:
         self._grid.set_thumbnail(path, image)
+        self._expanded_overlay.set_thumbnail(path, image)
         self._thumb_inflight = max(0, self._thumb_inflight - 1)
         self._dispatch_next_thumb()
 
@@ -887,6 +987,57 @@ class MainWindow(QMainWindow):
 
     def _toggle_filmstrip(self) -> None:
         self._left_panel.setVisible(not self._left_panel.isVisible())
+
+    # ------------------------------------------------------------------ #
+    # Expanded grid overlay                                                #
+    # ------------------------------------------------------------------ #
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._expanded_overlay.isVisible():
+            cw = self.centralWidget()
+            if cw:
+                self._expanded_overlay.setGeometry(cw.geometry())
+
+    def _open_expanded_grid(self) -> None:
+        cw = self.centralWidget()
+        if cw:
+            self._expanded_overlay.setGeometry(cw.geometry())
+        self._expanded_overlay.set_folder_label(
+            self._nav_label.text(), self._nav_label.toolTip()
+        )
+        self._expanded_overlay.refresh()
+        entry = self._folder_model.current
+        if entry:
+            self._expanded_overlay.select_path(entry.path)
+        self._expanded_overlay.show()
+        self._expanded_overlay.raise_()
+        self._expanded_overlay.setFocus()
+
+    def _close_expanded_grid(self) -> None:
+        self._expanded_overlay.hide()
+        entry = self._folder_model.current
+        if entry:
+            self._grid.select_path(entry.path)
+
+    def _on_expanded_image_selected(self, path: Path) -> None:
+        self._close_expanded_grid()
+        self.open_path(path)
+
+    def _on_expanded_folder_selected(self, path: Path) -> None:
+        self._open_folder(path)
+        self._expanded_overlay.refresh()
+        self._expanded_overlay.set_folder_label(
+            self._nav_label.text(), self._nav_label.toolTip()
+        )
+
+    def _reprioritize_thumbnails_expanded(self) -> None:
+        if not self._thumb_queue:
+            return
+        visible_set = set(self._expanded_overlay.get_visible_paths())
+        pending = [p for p in self._thumb_queue if p not in visible_set]
+        front   = [p for p in self._thumb_queue if p in visible_set]
+        self._thumb_queue = deque(front + pending)
 
     def _delete_current_file(self) -> None:
         entry = self._folder_model.current
