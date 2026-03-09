@@ -9,7 +9,8 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QImage, QColor, QPainter, QFont
 from PySide6.QtWidgets import (
-    QApplication, QListView, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QWidget,
+    QAbstractItemView, QApplication, QLineEdit, QListView, QStyle,
+    QStyledItemDelegate, QStyleOptionViewItem, QWidget,
 )
 
 from models.folder_model import FolderModel
@@ -53,6 +54,43 @@ class ThumbnailModel(QAbstractListModel):
         if role == Qt.ItemDataRole.UserRole:
             return entry
         return None
+
+    rename_done  = Signal(Path, Path)  # (old_path, new_path)
+    rename_error = Signal(str)
+
+    def flags(self, index: QModelIndex) -> Qt.ItemFlags:
+        base = super().flags(index)
+        if not index.isValid():
+            return base
+        entry: ImageEntry = self._folder[index.row()]
+        if entry and not entry.is_dir:
+            return base | Qt.ItemFlag.ItemIsEditable
+        return base
+
+    def setData(self, index: QModelIndex, value, role: int = Qt.ItemDataRole.EditRole) -> bool:
+        if role != Qt.ItemDataRole.EditRole or not index.isValid():
+            return False
+        entry: ImageEntry = self._folder[index.row()]
+        if entry.is_dir:
+            return False
+        new_stem = str(value).strip()
+        if not new_stem or new_stem == entry.path.stem:
+            return False
+        new_name = new_stem + entry.path.suffix
+        new_path = entry.path.parent / new_name
+        if new_path.exists():
+            self.rename_error.emit(f"'{new_name}' already exists")
+            return False
+        try:
+            entry.path.rename(new_path)
+        except OSError as exc:
+            self.rename_error.emit(str(exc))
+            return False
+        old_path = entry.path
+        entry.path = new_path
+        self.dataChanged.emit(index, index, [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.UserRole])
+        self.rename_done.emit(old_path, new_path)
+        return True
 
     def set_thumbnail(self, path: Path, image: QImage) -> None:
         """Called by background loader when a thumbnail is ready."""
@@ -124,6 +162,46 @@ class ThumbnailDelegate(QStyledItemDelegate):
 
         painter.restore()
 
+    def createEditor(
+        self, parent: QWidget, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> Optional[QWidget]:
+        entry: ImageEntry = index.data(Qt.ItemDataRole.UserRole)
+        if entry is None or entry.is_dir:
+            return None
+        editor = QLineEdit(parent)
+        editor.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        editor.setStyleSheet("""
+            QLineEdit {
+                background: #1a3a5c;
+                color: #fff;
+                border: 1px solid #4a8ccf;
+                border-radius: 2px;
+                font-size: 9px;
+                padding: 0 2px;
+            }
+        """)
+        return editor
+
+    def setEditorData(self, editor: QWidget, index: QModelIndex) -> None:
+        entry: ImageEntry = index.data(Qt.ItemDataRole.UserRole)
+        if entry and not entry.is_dir:
+            editor.setText(entry.path.stem)  # type: ignore[attr-defined]
+            editor.selectAll()               # type: ignore[attr-defined]
+
+    def setModelData(
+        self, editor: QWidget, model: QAbstractListModel, index: QModelIndex
+    ) -> None:
+        new_stem = editor.text().strip()  # type: ignore[attr-defined]
+        if new_stem:
+            model.setData(index, new_stem, Qt.ItemDataRole.EditRole)
+
+    def updateEditorGeometry(
+        self, editor: QWidget, option: QStyleOptionViewItem, index: QModelIndex
+    ) -> None:
+        rect = option.rect
+        label_rect = QRect(rect.x() + 2, rect.y() + rect.height() - 22, rect.width() - 4, 22)
+        editor.setGeometry(label_rect)
+
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         return QSize(CELL_SIZE, CELL_SIZE)
 
@@ -140,6 +218,8 @@ class GridView(QListView):
     image_activated  = Signal(Path)
     folder_activated = Signal(Path)
     scroll_changed   = Signal()   # emitted (debounced) when scroll position changes
+    rename_done      = Signal(Path, Path)  # (old_path, new_path)
+    rename_failed    = Signal(str)
 
     def __init__(
         self,
@@ -157,8 +237,12 @@ class GridView(QListView):
         self.setSpacing(4)
         self.setUniformItemSizes(True)
         self.setStyleSheet("background: #1e1e1e; border: none;")
+        self.setEditTriggers(QAbstractItemView.EditTrigger.EditKeyPressed)
         # Single-click OR keyboard navigation triggers the image
         self.selectionModel().currentChanged.connect(self._on_current_changed)
+        # Bubble rename signals from the model
+        self._thumb_model.rename_done.connect(self.rename_done)
+        self._thumb_model.rename_error.connect(self.rename_failed)
         # Debounced scroll → scroll_changed
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
@@ -208,6 +292,12 @@ class GridView(QListView):
                 self.scrollTo(idx)
                 self._suppress_selection = False
                 return
+
+    def start_rename(self) -> None:
+        """Trigger inline rename for the currently selected item (if any)."""
+        idx = self.currentIndex()
+        if idx.isValid():
+            self.edit(idx)
 
     def _on_current_changed(self, current: QModelIndex, _previous: QModelIndex) -> None:
         if self._suppress_selection or not current.isValid():

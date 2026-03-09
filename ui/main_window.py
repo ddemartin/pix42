@@ -162,6 +162,8 @@ class ExpandedGridOverlay(QWidget):
     folder_selected = Signal(Path)
     close_requested = Signal()
     scroll_changed  = Signal()
+    rename_done     = Signal(Path, Path)
+    rename_failed   = Signal(str)
 
     def __init__(self, folder_model: FolderModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -200,6 +202,8 @@ class ExpandedGridOverlay(QWidget):
         self._inner_grid.image_activated.connect(self.image_selected)
         self._inner_grid.folder_activated.connect(self.folder_selected)
         self._inner_grid.scroll_changed.connect(self.scroll_changed)
+        self._inner_grid.rename_done.connect(self.rename_done)
+        self._inner_grid.rename_failed.connect(self.rename_failed)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -218,6 +222,9 @@ class ExpandedGridOverlay(QWidget):
 
     def get_visible_paths(self) -> list[Path]:
         return self._inner_grid.get_visible_paths()
+
+    def start_rename(self) -> None:
+        self._inner_grid.start_rename()
 
     def set_folder_label(self, text: str, tooltip: str = "") -> None:
         self._folder_lbl.setText(text)
@@ -608,6 +615,11 @@ class MainWindow(QMainWindow):
         self._act_rotate.triggered.connect(self._enter_rotate_mode)
         edit_menu.addAction(self._act_rotate)
         edit_menu.addSeparator()
+        rename_act = QAction("Re&name", self)
+        rename_act.setShortcut(QKeySequence("F2"))
+        rename_act.triggered.connect(self._start_rename)
+        edit_menu.addAction(rename_act)
+        edit_menu.addSeparator()
         settings_act = QAction("&Settings…", self)
         settings_act.setShortcut(QKeySequence("Ctrl+,"))
         settings_act.triggered.connect(self._open_settings)
@@ -649,6 +661,10 @@ class MainWindow(QMainWindow):
         self._expanded_overlay.folder_selected.connect(self._on_expanded_folder_selected)
         self._expanded_overlay.close_requested.connect(self._close_expanded_grid)
         self._expanded_overlay.scroll_changed.connect(self._reprioritize_thumbnails_expanded)
+        self._grid.rename_done.connect(self._on_rename_done)
+        self._grid.rename_failed.connect(self._on_rename_failed)
+        self._expanded_overlay.rename_done.connect(self._on_rename_done)
+        self._expanded_overlay.rename_failed.connect(self._on_rename_failed)
 
     # ------------------------------------------------------------------ #
     # File opening                                                         #
@@ -987,6 +1003,23 @@ class MainWindow(QMainWindow):
 
     def _toggle_filmstrip(self) -> None:
         self._left_panel.setVisible(not self._left_panel.isVisible())
+
+    def _start_rename(self) -> None:
+        if self._expanded_overlay.isVisible():
+            self._expanded_overlay.start_rename()
+        else:
+            self._grid.start_rename()
+
+    def _on_rename_done(self, old_path: Path, new_path: Path) -> None:
+        self._cache.invalidate(old_path)
+        self._thumb_done.discard(old_path)
+        self._thumb_done.add(new_path)
+        entry = self._folder_model.current
+        if entry and entry.path == new_path:
+            self._lbl_path.setText(str(new_path))
+
+    def _on_rename_failed(self, msg: str) -> None:
+        self._status_bar.showMessage(f"Rename failed: {msg}", 4000)
 
     # ------------------------------------------------------------------ #
     # Expanded grid overlay                                                #
