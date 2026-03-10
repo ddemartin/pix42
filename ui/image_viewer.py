@@ -55,6 +55,8 @@ class ImageViewer(QWidget):
         self._stretch_small: bool = True
         self._movie: Optional[QMovie] = None
         self._rotation: int = 0     # degrees CW: 0 / 90 / 180 / 270
+        self._flip_h: bool = False
+        self._flip_v: bool = False
         self._bg_color: QColor = QColor(30, 30, 30)
 
         self._crop_mode: bool = False
@@ -132,6 +134,16 @@ class ImageViewer(QWidget):
     def get_rotation(self) -> int:
         """Return current display rotation in degrees CW."""
         return self._rotation
+
+    def set_flip(self, h: bool, v: bool) -> None:
+        """Set display flip (horizontal and/or vertical) and redraw."""
+        self._flip_h = h
+        self._flip_v = v
+        self.update()
+
+    def get_flip(self) -> tuple[bool, bool]:
+        """Return (flip_h, flip_v) display flags."""
+        return self._flip_h, self._flip_v
 
     def set_stretch_small(self, enabled: bool) -> None:
         """If *enabled*, small images are upscaled to fill the viewport.
@@ -296,6 +308,9 @@ class ImageViewer(QWidget):
         painter.translate(cx, cy)
         if self._rotation:
             painter.rotate(self._rotation)
+        if self._flip_h or self._flip_v:
+            painter.scale(-1.0 if self._flip_h else 1.0,
+                          -1.0 if self._flip_v else 1.0)
         hw = iw * zoom / 2.0
         hh = ih * zoom / 2.0
         painter.drawImage(

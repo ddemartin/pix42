@@ -31,6 +31,7 @@ from ui.image_viewer import ImageViewer
 from ui.overlay_bar import OverlayBar
 from ui.navigator_widget import NavigatorWidget
 from ui.grid_view import GridView
+from ui.flip_bar import FlipBar
 from ui.slideshow_bar import SlideShowBar
 from ui.spinner_widget import SpinnerWidget
 from utils.threading import LoadImageWorker, ThumbnailWorker, FullResWorker, ThreadWorker
@@ -50,6 +51,9 @@ _ADJUSTABLE_SUFFIXES = _CROPPABLE_SUFFIXES
 
 # Rotation works for all PIL-writable formats plus animated GIF
 _ROTATABLE_SUFFIXES = _CROPPABLE_SUFFIXES | frozenset({".gif"})
+
+# Flip shares the same set as rotation
+_FLIPPABLE_SUFFIXES = _ROTATABLE_SUFFIXES
 
 
 # ------------------------------------------------------------------ #
@@ -267,11 +271,13 @@ class ViewerContainer(QWidget):
         self.crop_bar      = CropBar(self)
         self.adjust_bar    = AdjustBar(self)
         self.rotate_bar    = RotateBar(self)
+        self.flip_bar      = FlipBar(self)
         self.slideshow_bar = SlideShowBar(self)
         self.overlay.hide()
         self.crop_bar.hide()
         self.adjust_bar.hide()
         self.rotate_bar.hide()
+        self.flip_bar.hide()
         self.slideshow_bar.hide()
 
         self._stack = QStackedWidget(self)
@@ -366,6 +372,11 @@ class ViewerContainer(QWidget):
             rw = self.rotate_bar.sizeHint().width()
             rh = self.rotate_bar.sizeHint().height()
             self.rotate_bar.setGeometry((self.width() - rw) // 2, m, rw, rh)
+        # FlipBar — top-centre (only when visible)
+        if self.flip_bar.isVisible():
+            fw = self.flip_bar.sizeHint().width()
+            fh = self.flip_bar.sizeHint().height()
+            self.flip_bar.setGeometry((self.width() - fw) // 2, m, fw, fh)
         # SlideShowBar — top-centre (only when visible)
         if self.slideshow_bar.isVisible():
             sw = self.slideshow_bar.sizeHint().width()
@@ -416,6 +427,7 @@ class MainWindow(QMainWindow):
         self._crop_mode_active: bool = False
         self._adjust_mode_active: bool = False
         self._rotate_mode_active: bool = False
+        self._flip_mode_active: bool = False
         self._slideshow_active: bool = False
         self._slideshow_playing: bool = False
         self._slideshow_timer = QTimer(self)
@@ -631,6 +643,11 @@ class MainWindow(QMainWindow):
         self._act_rotate.setEnabled(False)
         self._act_rotate.triggered.connect(self._enter_rotate_mode)
         edit_menu.addAction(self._act_rotate)
+        self._act_flip = QAction("F&lip…", self)
+        self._act_flip.setShortcut(QKeySequence("L"))
+        self._act_flip.setEnabled(False)
+        self._act_flip.triggered.connect(self._enter_flip_mode)
+        edit_menu.addAction(self._act_flip)
         edit_menu.addSeparator()
         rename_act = QAction("Re&name", self)
         rename_act.setShortcut(QKeySequence("F2"))
@@ -762,6 +779,8 @@ class MainWindow(QMainWindow):
             self._exit_adjust_mode()
         if self._rotate_mode_active:
             self._exit_rotate_mode()
+        if self._flip_mode_active:
+            self._exit_flip_mode()
         entry = self._folder_model.current
         if entry is None:
             return
@@ -798,6 +817,7 @@ class MainWindow(QMainWindow):
         self._act_crop.setEnabled(suffix in _CROPPABLE_SUFFIXES and not animated)
         self._act_adjust.setEnabled(suffix in _ADJUSTABLE_SUFFIXES and not animated)
         self._act_rotate.setEnabled(suffix in _ROTATABLE_SUFFIXES)
+        self._act_flip.setEnabled(suffix in _FLIPPABLE_SUFFIXES)
         if handle.preview and not handle.preview.isNull():
             self._container.viewer.set_native_size(m.width, m.height)
             if animated:
@@ -1574,6 +1594,149 @@ class MainWindow(QMainWindow):
                 disposal=2,
             )
 
+    # ------------------------------------------------------------------ #
+    # Flip                                                                 #
+    # ------------------------------------------------------------------ #
+
+    def _enter_flip_mode(self) -> None:
+        if self._current_handle is None or self._flip_mode_active:
+            return
+        if self._slideshow_active:
+            self._exit_slideshow()
+        suffix = self._current_handle.path.suffix.lower()
+        if suffix not in _FLIPPABLE_SUFFIXES:
+            return
+        self._flip_mode_active = True
+        flip_bar = self._container.flip_bar
+        flip_bar.reset()
+        flip_bar.set_overwrite_allowed(suffix in _CROPPABLE_SUFFIXES)
+        flip_bar.show()
+        flip_bar.raise_()
+        self._container._reposition_overlays()
+        self._container.overlay.hide()
+        flip_bar.flip_h_requested.connect(self._on_flip_h)
+        flip_bar.flip_v_requested.connect(self._on_flip_v)
+        flip_bar.cancel_requested.connect(self._exit_flip_mode)
+        flip_bar.save_as_requested.connect(self._on_flip_save_as)
+        flip_bar.overwrite_requested.connect(self._on_flip_overwrite)
+
+    def _exit_flip_mode(self) -> None:
+        if not self._flip_mode_active:
+            return
+        self._flip_mode_active = False
+        flip_bar = self._container.flip_bar
+        flip_bar.hide()
+        self._container.viewer.set_flip(False, False)
+        try:
+            flip_bar.flip_h_requested.disconnect(self._on_flip_h)
+            flip_bar.flip_v_requested.disconnect(self._on_flip_v)
+            flip_bar.cancel_requested.disconnect(self._exit_flip_mode)
+            flip_bar.save_as_requested.disconnect(self._on_flip_save_as)
+            flip_bar.overwrite_requested.disconnect(self._on_flip_overwrite)
+        except RuntimeError:
+            pass
+
+    def _on_flip_h(self) -> None:
+        bar = self._container.flip_bar
+        self._container.viewer.set_flip(bar.flip_h, bar.flip_v)
+
+    def _on_flip_v(self) -> None:
+        bar = self._container.flip_bar
+        self._container.viewer.set_flip(bar.flip_h, bar.flip_v)
+
+    def _on_flip_save_as(self) -> None:
+        if self._current_handle is None:
+            return
+        path   = self._current_handle.path
+        suffix = path.suffix.lower()
+        fmt_filters = {
+            ".jpg":  "JPEG (*.jpg *.jpeg)",
+            ".jpeg": "JPEG (*.jpg *.jpeg)",
+            ".png":  "PNG (*.png)",
+            ".bmp":  "BMP (*.bmp)",
+            ".tif":  "TIFF (*.tif *.tiff)",
+            ".tiff": "TIFF (*.tif *.tiff)",
+            ".webp": "WebP (*.webp)",
+            ".gif":  "GIF (*.gif)",
+        }
+        default_filter = fmt_filters.get(suffix, "PNG (*.png)")
+        all_filter = "All images (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp *.gif)"
+        default_path = str(path.parent / (path.stem + "_flipped" + path.suffix))
+        out_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Flipped Image", default_path,
+            f"{default_filter};;{all_filter}",
+        )
+        if out_path:
+            self._save_flipped(Path(out_path))
+
+    def _on_flip_overwrite(self) -> None:
+        if self._current_handle is None:
+            return
+        self._save_flipped(self._current_handle.path, invalidate=True)
+
+    def _save_flipped(self, dest: Path, *, invalidate: bool = False) -> None:
+        from PIL import Image, ImageOps
+        bar    = self._container.flip_bar
+        flip_h = bar.flip_h
+        flip_v = bar.flip_v
+        if not flip_h and not flip_v:
+            return
+        src    = self._current_handle.path
+        suffix = src.suffix.lower()
+        try:
+            if suffix == ".gif":
+                self._save_flipped_gif(src, dest, flip_h, flip_v)
+            else:
+                with Image.open(src) as img:
+                    if flip_h:
+                        img = ImageOps.mirror(img)
+                    if flip_v:
+                        img = ImageOps.flip(img)
+                    kwargs: dict = {}
+                    out_suffix = dest.suffix.lower()
+                    if out_suffix in (".jpg", ".jpeg"):
+                        kwargs["quality"] = 95
+                        exif = img.info.get("exif")
+                        if exif:
+                            kwargs["exif"] = exif
+                    elif out_suffix in (".tif", ".tiff"):
+                        kwargs["compression"] = "tiff_lzw"
+                    img.save(dest, **kwargs)
+            if invalidate:
+                self._container.viewer._stop_movie()
+                self._cache.invalidate(src)
+                self._exit_flip_mode()
+                self._load_current()
+            else:
+                self._exit_flip_mode()
+            self._status_bar.showMessage(f"Saved: {dest.name}", 4000)
+        except Exception as exc:
+            QMessageBox.warning(self, "Flip Failed", str(exc))
+
+    def _save_flipped_gif(self, src: Path, dest: Path, flip_h: bool, flip_v: bool) -> None:
+        from PIL import Image, ImageOps
+        with Image.open(src) as pil_img:
+            n_frames = getattr(pil_img, "n_frames", 1)
+            frames: list = []
+            durations: list = []
+            for i in range(n_frames):
+                pil_img.seek(i)
+                frame = pil_img.convert("RGBA")
+                if flip_h:
+                    frame = ImageOps.mirror(frame)
+                if flip_v:
+                    frame = ImageOps.flip(frame)
+                frames.append(frame)
+                durations.append(pil_img.info.get("duration", 100))
+        if frames:
+            frames[0].save(
+                dest, format="GIF", save_all=True,
+                append_images=frames[1:],
+                loop=0,
+                duration=durations,
+                disposal=2,
+            )
+
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self._settings, self._container.viewer, self, app=self._app)
         dlg.exec()
@@ -1605,6 +1768,8 @@ class MainWindow(QMainWindow):
                 self._exit_adjust_mode()
             elif self._rotate_mode_active:
                 self._exit_rotate_mode()
+            elif self._flip_mode_active:
+                self._exit_flip_mode()
             elif self._slideshow_active:
                 self._exit_slideshow()
             elif self.isFullScreen():
