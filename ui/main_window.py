@@ -31,6 +31,7 @@ from ui.image_viewer import ImageViewer
 from ui.overlay_bar import OverlayBar
 from ui.navigator_widget import NavigatorWidget
 from ui.grid_view import GridView
+from ui.slideshow_bar import SlideShowBar
 from ui.spinner_widget import SpinnerWidget
 from utils.threading import LoadImageWorker, ThumbnailWorker, FullResWorker, ThreadWorker
 from utils.settings_manager import SettingsManager
@@ -263,13 +264,15 @@ class ViewerContainer(QWidget):
         self.overlay      = OverlayBar(self)
         self.navigator    = NavigatorWidget(self)
         self.spinner      = SpinnerWidget(self)
-        self.crop_bar     = CropBar(self)
-        self.adjust_bar   = AdjustBar(self)
-        self.rotate_bar   = RotateBar(self)
+        self.crop_bar      = CropBar(self)
+        self.adjust_bar    = AdjustBar(self)
+        self.rotate_bar    = RotateBar(self)
+        self.slideshow_bar = SlideShowBar(self)
         self.overlay.hide()
         self.crop_bar.hide()
         self.adjust_bar.hide()
         self.rotate_bar.hide()
+        self.slideshow_bar.hide()
 
         self._stack = QStackedWidget(self)
         self._stack.addWidget(self.viewer)       # index 0
@@ -363,6 +366,11 @@ class ViewerContainer(QWidget):
             rw = self.rotate_bar.sizeHint().width()
             rh = self.rotate_bar.sizeHint().height()
             self.rotate_bar.setGeometry((self.width() - rw) // 2, m, rw, rh)
+        # SlideShowBar — top-centre (only when visible)
+        if self.slideshow_bar.isVisible():
+            sw = self.slideshow_bar.sizeHint().width()
+            sh = self.slideshow_bar.sizeHint().height()
+            self.slideshow_bar.setGeometry((self.width() - sw) // 2, m, sw, sh)
 
 
 class MainWindow(QMainWindow):
@@ -408,6 +416,10 @@ class MainWindow(QMainWindow):
         self._crop_mode_active: bool = False
         self._adjust_mode_active: bool = False
         self._rotate_mode_active: bool = False
+        self._slideshow_active: bool = False
+        self._slideshow_playing: bool = False
+        self._slideshow_timer = QTimer(self)
+        self._slideshow_timer.timeout.connect(self._slideshow_advance)
         self._adjust_original_qimage: Optional[QImage] = None
         self._adjust_preview_pil = None   # PIL.Image of displayed frame
         self._adjust_seq: int = 0         # stale-result guard
@@ -590,6 +602,11 @@ class MainWindow(QMainWindow):
         full_act.triggered.connect(self._toggle_fullscreen)
         view_menu.addAction(full_act)
 
+        slideshow_act = QAction("S&lideshow", self)
+        slideshow_act.setShortcut(QKeySequence("F5"))
+        slideshow_act.triggered.connect(self._enter_slideshow)
+        view_menu.addAction(slideshow_act)
+
         view_menu.addSeparator()
         self._stretch_act = QAction("&Stretch Small Images", self)
         self._stretch_act.setCheckable(True)
@@ -665,6 +682,11 @@ class MainWindow(QMainWindow):
         self._grid.rename_failed.connect(self._on_rename_failed)
         self._expanded_overlay.rename_done.connect(self._on_rename_done)
         self._expanded_overlay.rename_failed.connect(self._on_rename_failed)
+        ss = self._container.slideshow_bar
+        ss.play_pause_requested.connect(self._slideshow_toggle_play)
+        ss.stop_requested.connect(self._exit_slideshow)
+        ss.order_toggled.connect(self._slideshow_order_toggled)
+        ss.interval_changed.connect(self._slideshow_interval_changed)
 
     # ------------------------------------------------------------------ #
     # File opening                                                         #
@@ -1022,6 +1044,80 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"Rename failed: {msg}", 4000)
 
     # ------------------------------------------------------------------ #
+    # Slideshow                                                            #
+    # ------------------------------------------------------------------ #
+
+    def _enter_slideshow(self) -> None:
+        if self._slideshow_active:
+            return
+        if self._folder_model.current is None:
+            return
+        # Exit any active edit mode before starting slideshow
+        if self._crop_mode_active:
+            self._exit_crop_mode()
+        if self._adjust_mode_active:
+            self._exit_adjust_mode()
+        if self._rotate_mode_active:
+            self._exit_rotate_mode()
+        self._slideshow_active = True
+        self._slideshow_playing = False
+        bar = self._container.slideshow_bar
+        bar.reset()
+        bar.show()
+        bar.raise_()
+        self._container._reposition_overlays()
+
+    def _exit_slideshow(self) -> None:
+        if not self._slideshow_active:
+            return
+        self._slideshow_active = False
+        self._slideshow_playing = False
+        self._slideshow_timer.stop()
+        self._container.slideshow_bar.hide()
+
+    def _slideshow_toggle_play(self) -> None:
+        self._slideshow_playing = not self._slideshow_playing
+        if self._slideshow_playing:
+            interval_ms = self._container.slideshow_bar.interval * 1000
+            self._slideshow_timer.start(interval_ms)
+        else:
+            self._slideshow_timer.stop()
+
+    def _slideshow_order_toggled(self) -> None:
+        pass  # bar already tracks its own state; advance uses bar.is_random
+
+    def _slideshow_interval_changed(self, seconds: int) -> None:
+        if self._slideshow_playing:
+            self._slideshow_timer.setInterval(seconds * 1000)
+
+    def _slideshow_advance(self) -> None:
+        import random as _random
+        file_indices = [
+            i for i in range(self._folder_model.count)
+            if not self._folder_model[i].is_dir
+        ]
+        if not file_indices:
+            return
+        bar = self._container.slideshow_bar
+        current_idx = self._folder_model.current_index
+        if bar.is_random:
+            choices = [i for i in file_indices if i != current_idx]
+            if not choices:
+                return
+            target = _random.choice(choices)
+        else:
+            try:
+                pos = file_indices.index(current_idx)
+            except ValueError:
+                pos = -1
+            target = file_indices[(pos + 1) % len(file_indices)]
+        self._folder_model.go_to(target)
+        entry = self._folder_model.current
+        if entry:
+            self._grid.select_path(entry.path)
+        self._load_current()
+
+    # ------------------------------------------------------------------ #
     # Expanded grid overlay                                                #
     # ------------------------------------------------------------------ #
 
@@ -1122,6 +1218,8 @@ class MainWindow(QMainWindow):
     def _enter_crop_mode(self) -> None:
         if self._current_handle is None or self._crop_mode_active:
             return
+        if self._slideshow_active:
+            self._exit_slideshow()
         self._crop_mode_active = True
         viewer   = self._container.viewer
         crop_bar = self._container.crop_bar
@@ -1221,6 +1319,8 @@ class MainWindow(QMainWindow):
     def _enter_adjust_mode(self) -> None:
         if self._current_handle is None or self._adjust_mode_active:
             return
+        if self._slideshow_active:
+            self._exit_slideshow()
         viewer = self._container.viewer
         if viewer._image is None or viewer._image.isNull():
             return
@@ -1342,6 +1442,8 @@ class MainWindow(QMainWindow):
     def _enter_rotate_mode(self) -> None:
         if self._current_handle is None or self._rotate_mode_active:
             return
+        if self._slideshow_active:
+            self._exit_slideshow()
         suffix = self._current_handle.path.suffix.lower()
         if suffix not in _ROTATABLE_SUFFIXES:
             return
@@ -1503,6 +1605,8 @@ class MainWindow(QMainWindow):
                 self._exit_adjust_mode()
             elif self._rotate_mode_active:
                 self._exit_rotate_mode()
+            elif self._slideshow_active:
+                self._exit_slideshow()
             elif self.isFullScreen():
                 self.showNormal()
         else:
