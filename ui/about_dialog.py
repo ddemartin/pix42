@@ -18,6 +18,7 @@ _CREDITS = [
     ("astropy",    "FITS astronomical image support"),
     ("NumPy",      "Numerical array operations"),
     ("psutil",     "System resource monitoring"),
+    ("CuPy",       "GPU-accelerated array operations (optional, requires CUDA)"),
 ]
 
 _STYLE = """
