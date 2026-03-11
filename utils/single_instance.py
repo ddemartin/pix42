@@ -32,11 +32,20 @@ class SingleInstance(QObject):
         Attempt to claim the named server.
 
         Returns True if this process is now the primary instance.
-        Removes any stale server socket left by a previous crash before
-        trying to listen, so crashes never block future launches.
+        Probes for a live server first; only removes the socket file if
+        no one is listening (stale crash remnant), so an already-running
+        instance is never evicted.
         """
+        probe = QLocalSocket()
+        probe.connectToServer(self.PIPE_NAME)
+        if probe.waitForConnected(500):
+            probe.disconnectFromServer()
+            return False  # a live primary instance already exists
+
+        probe.abort()
+
         self._server = QLocalServer(self)
-        QLocalServer.removeServer(self.PIPE_NAME)
+        QLocalServer.removeServer(self.PIPE_NAME)  # clean up stale socket
         ok = self._server.listen(self.PIPE_NAME)
         if ok:
             self._server.newConnection.connect(self._on_connection)
