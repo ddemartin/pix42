@@ -125,6 +125,11 @@ class ImageLoader:
         self._cache.put(cache_key, image, size_bytes)
         return image
 
+    def read_metadata(self, path: Path | str) -> ImageMetadata:
+        """Read lightweight metadata without decoding pixels."""
+        path = Path(path)
+        return self._select_decoder(path).read_metadata(path)
+
     def has_fullres(self, path: Path | str) -> bool:
         """Return True if the full-resolution image is already in cache."""
         return self._cache.get((str(Path(path)), "fullres")) is not None

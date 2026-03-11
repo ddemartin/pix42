@@ -24,26 +24,88 @@ class ThumbnailModel(QAbstractListModel):
     """
     Qt model adapter over FolderModel.
 
-    Thumbnails are displayed via the ``Qt.ItemDataRole.DecorationRole``.
-    Missing thumbnails show a placeholder until loaded asynchronously.
+    Supports live filtering by filename and/or cached metadata text
+    (``ImageEntry.search_text``).  The internal ``_visible`` list holds the
+    real FolderModel indices that pass the current filter.
     """
+
+    rename_done  = Signal(Path, Path)  # (old_path, new_path)
+    rename_error = Signal(str)
 
     def __init__(self, folder_model: FolderModel, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._folder = folder_model
         self._placeholder = self._make_placeholder()
+        self._filter: str = ""
+        self._visible: list[int] = []
+        self._rebuild_visible()
+
+    # ------------------------------------------------------------------ #
+    # Filter                                                               #
+    # ------------------------------------------------------------------ #
+
+    def set_filter(self, text: str) -> None:
+        self._filter = text.lower().strip()
+        self.beginResetModel()
+        self._rebuild_visible()
+        self.endResetModel()
+
+    def refresh_filter(self) -> None:
+        """Re-apply current filter (call after search_text on entries changes)."""
+        self.beginResetModel()
+        self._rebuild_visible()
+        self.endResetModel()
+
+    def _rebuild_visible(self) -> None:
+        q = self._filter
+        total = self._folder.count
+        if not q:
+            self._visible = list(range(total))
+            return
+        vis = []
+        for i in range(total):
+            entry = self._folder[i]
+            if entry.is_dir:
+                vis.append(i)
+                continue
+            if q in entry.filename.lower():
+                vis.append(i)
+            elif entry.search_text and q in entry.search_text:
+                vis.append(i)
+        self._visible = vis
+
+    def find_visible_row(self, path: Path) -> int:
+        """Return visual row for *path*, or -1 if not currently visible."""
+        for vis_row, actual in enumerate(self._visible):
+            if self._folder[actual].path == path:
+                return vis_row
+        return -1
+
+    @property
+    def filter_stats(self) -> tuple[int, int]:
+        """(visible_files, total_files) — dirs excluded from both counts."""
+        total = sum(1 for i in range(self._folder.count) if not self._folder[i].is_dir)
+        if not self._filter:
+            return total, total
+        visible = sum(1 for i in self._visible if not self._folder[i].is_dir)
+        return visible, total
+
+    # ------------------------------------------------------------------ #
+    # Qt model interface                                                   #
+    # ------------------------------------------------------------------ #
 
     def refresh(self) -> None:
         self.beginResetModel()
+        self._rebuild_visible()
         self.endResetModel()
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return self._folder.count
+        return len(self._visible)
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole):
-        if not index.isValid() or index.row() >= self._folder.count:
+        if not index.isValid() or index.row() >= len(self._visible):
             return None
-        entry: ImageEntry = self._folder[index.row()]
+        entry: ImageEntry = self._folder[self._visible[index.row()]]
 
         if role == Qt.ItemDataRole.DisplayRole:
             return entry.filename
@@ -55,14 +117,11 @@ class ThumbnailModel(QAbstractListModel):
             return entry
         return None
 
-    rename_done  = Signal(Path, Path)  # (old_path, new_path)
-    rename_error = Signal(str)
-
     def flags(self, index: QModelIndex) -> Qt.ItemFlags:
         base = super().flags(index)
         if not index.isValid():
             return base
-        entry: ImageEntry = self._folder[index.row()]
+        entry: ImageEntry = self._folder[self._visible[index.row()]]
         if entry and not entry.is_dir:
             return base | Qt.ItemFlag.ItemIsEditable
         return base
@@ -70,7 +129,7 @@ class ThumbnailModel(QAbstractListModel):
     def setData(self, index: QModelIndex, value, role: int = Qt.ItemDataRole.EditRole) -> bool:
         if role != Qt.ItemDataRole.EditRole or not index.isValid():
             return False
-        entry: ImageEntry = self._folder[index.row()]
+        entry: ImageEntry = self._folder[self._visible[index.row()]]
         if entry.is_dir:
             return False
         new_stem = str(value).strip()
@@ -94,11 +153,15 @@ class ThumbnailModel(QAbstractListModel):
 
     def set_thumbnail(self, path: Path, image: QImage) -> None:
         """Called by background loader when a thumbnail is ready."""
-        for row in range(self._folder.count):
-            if self._folder[row].path == path:
-                self._folder[row].thumbnail = image
-                idx = self.index(row)
-                self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+        for actual_row in range(self._folder.count):
+            if self._folder[actual_row].path == path:
+                self._folder[actual_row].thumbnail = image
+                try:
+                    vis_row = self._visible.index(actual_row)
+                    idx = self.index(vis_row)
+                    self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DecorationRole])
+                except ValueError:
+                    pass  # item not visible (filtered out)
                 return
 
     @staticmethod
@@ -236,12 +299,13 @@ class GridView(QListView):
     multi_selection_changed(list) -- emitted when Ctrl+click selection changes
     """
 
-    image_activated        = Signal(Path)
-    folder_activated       = Signal(Path)
-    scroll_changed         = Signal()   # emitted (debounced) when scroll position changes
-    rename_done            = Signal(Path, Path)  # (old_path, new_path)
-    rename_failed          = Signal(str)
-    multi_selection_changed = Signal(list)  # list[Path]
+    image_activated         = Signal(Path)
+    folder_activated        = Signal(Path)
+    scroll_changed          = Signal()   # emitted (debounced) when scroll position changes
+    rename_done             = Signal(Path, Path)  # (old_path, new_path)
+    rename_failed           = Signal(str)
+    multi_selection_changed = Signal(list)   # list[Path]
+    filter_stats_changed    = Signal(int, int)  # (visible_files, total_files)
 
     def __init__(
         self,
@@ -302,19 +366,25 @@ class GridView(QListView):
                 paths.append(entry.path)
         return paths
 
+    def set_filter(self, text: str) -> None:
+        """Apply filename/metadata filter and emit updated stats."""
+        self._thumb_model.set_filter(text)
+        self.filter_stats_changed.emit(*self._thumb_model.filter_stats)
+
+    def refresh_filter(self) -> None:
+        """Re-apply current filter after entry.search_text updates."""
+        self._thumb_model.refresh_filter()
+        self.filter_stats_changed.emit(*self._thumb_model.filter_stats)
+
     def select_path(self, path: Path) -> None:
         """Select an item programmatically without triggering image_activated."""
-        for row in range(self._thumb_model.rowCount()):
-            entry: ImageEntry = self._thumb_model.data(
-                self._thumb_model.index(row), Qt.ItemDataRole.UserRole
-            )
-            if entry and entry.path == path:
-                self._suppress_selection = True
-                idx = self._thumb_model.index(row)
-                self.setCurrentIndex(idx)
-                self.scrollTo(idx)
-                self._suppress_selection = False
-                return
+        vis_row = self._thumb_model.find_visible_row(path)
+        if vis_row >= 0:
+            self._suppress_selection = True
+            idx = self._thumb_model.index(vis_row)
+            self.setCurrentIndex(idx)
+            self.scrollTo(idx)
+            self._suppress_selection = False
 
     def start_rename(self) -> None:
         """Trigger inline rename for the currently selected item (if any)."""

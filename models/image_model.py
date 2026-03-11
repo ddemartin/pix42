@@ -26,6 +26,7 @@ class ImageEntry:
     is_loading: bool = False
     load_error: Optional[str] = None
     is_dir: bool = False
+    search_text: str = ""   # cached metadata string for search, set by scan worker
 
     # ------------------------------------------------------------------ #
     # Convenience properties                                               #

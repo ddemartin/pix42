@@ -13,6 +13,7 @@ from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QMouseEvent, QM
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QStackedWidget, QFileDialog, QMessageBox, QStatusBar, QLabel, QPushButton,
+    QLineEdit,
 )
 
 from config import config as app_config
@@ -277,6 +278,69 @@ def _fmt_size(n_bytes: int) -> str:
     return f"{n_bytes} B"
 
 
+def _build_meta_search_string(meta: "ImageMetadata") -> str:
+    """Combine EXIF/metadata fields into a single lowercase searchable string."""
+    exif = meta.exif or {}
+
+    def _xp(v) -> str:
+        if isinstance(v, bytes):
+            return v.decode("utf-16-le").rstrip("\x00")
+        return str(v).rstrip("\x00") if v else ""
+
+    parts = [
+        _xp(exif.get("XPTitle", "")),
+        str(exif.get("ImageDescription", "") or ""),
+        _xp(exif.get("XPKeywords", "")),
+        str(exif.get("Copyright", "") or ""),
+        str(exif.get("Artist", "") or ""),
+        str(exif.get("Make", "") or ""),
+        str(exif.get("Model", "") or ""),
+    ]
+    return " ".join(p.strip() for p in parts if p.strip()).lower()
+
+
+# ------------------------------------------------------------------ #
+# Metadata scan worker                                                  #
+# ------------------------------------------------------------------ #
+
+class _MetaScanSignals(QObject):
+    meta_ready = Signal(int, str, int)  # (entry_index, search_string, seq)
+    finished   = Signal(int)            # seq
+
+
+class _MetaScanWorker(QRunnable):
+    """Read metadata for all files and emit search strings."""
+
+    def __init__(self, folder_model, loader, seq: int, stop: "threading.Event") -> None:
+        super().__init__()
+        self._entries = list(folder_model)   # snapshot — safe across folder changes
+        self._loader  = loader
+        self._seq     = seq
+        self._stop    = stop
+        self.signals  = _MetaScanSignals()
+        self.setAutoDelete(True)
+
+    @Slot()
+    def run(self) -> None:
+        for i, entry in enumerate(self._entries):
+            if self._stop.is_set():
+                break
+            if entry.is_dir or entry.search_text:
+                continue
+            try:
+                meta = self._loader.read_metadata(entry.path)
+                s    = _build_meta_search_string(meta)
+                self.signals.meta_ready.emit(i, s, self._seq)
+            except RuntimeError:
+                return
+            except Exception:
+                pass
+        try:
+            self.signals.finished.emit(self._seq)
+        except RuntimeError:
+            pass
+
+
 class ExpandedGridOverlay(QWidget):
     """
     Full-window thumbnail browser overlay.
@@ -322,8 +386,25 @@ class ExpandedGridOverlay(QWidget):
         self._folder_lbl = QLabel("", header)
         self._folder_lbl.setStyleSheet("color: #ccc; font-size: 11px;")
 
+        self._search_input = QLineEdit(header)
+        self._search_input.setPlaceholderText("Search…")
+        self._search_input.setFixedWidth(200)
+        self._search_input.setFixedHeight(24)
+        self._search_input.setStyleSheet("""
+            QLineEdit {
+                background: #1a1a1a; color: #ddd; border: 1px solid #444;
+                border-radius: 3px; padding: 2px 6px; font-size: 11px;
+            }
+            QLineEdit:focus { border-color: #4a8ccf; }
+        """)
+
+        self._search_count = QLabel("", header)
+        self._search_count.setStyleSheet("color: #666; font-size: 10px; min-width: 40px;")
+
         hl.addWidget(self._close_btn)
         hl.addWidget(self._folder_lbl, stretch=1)
+        hl.addWidget(self._search_input)
+        hl.addWidget(self._search_count)
 
         # Grid
         self._inner_grid = GridView(folder_model, self)
@@ -358,6 +439,23 @@ class ExpandedGridOverlay(QWidget):
         self._folder_lbl.setText(text)
         self._folder_lbl.setToolTip(tooltip)
 
+    def set_filter(self, text: str) -> None:
+        """Apply filter and sync search box text."""
+        self._inner_grid.set_filter(text)
+        if self._search_input.text() != text:
+            self._search_input.blockSignals(True)
+            self._search_input.setText(text)
+            self._search_input.blockSignals(False)
+
+    def set_search_count(self, visible: int, total: int) -> None:
+        self._search_count.setText(f"{visible}/{total}" if visible != total else "")
+
+    def refresh_filter(self) -> None:
+        self._inner_grid.refresh_filter()
+
+    def get_filter_stats(self) -> tuple[int, int]:
+        return self._inner_grid._thumb_model.filter_stats
+
     def paintEvent(self, event) -> None:
         from PySide6.QtGui import QPainter
         painter = QPainter(self)
@@ -365,7 +463,13 @@ class ExpandedGridOverlay(QWidget):
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:
-            self.close_requested.emit()
+            if self._search_input.text():
+                self._search_input.clear()
+            else:
+                self.close_requested.emit()
+        elif event.key() == Qt.Key.Key_F and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._search_input.setFocus()
+            self._search_input.selectAll()
         else:
             super().keyPressEvent(event)
 
@@ -573,6 +677,20 @@ class MainWindow(QMainWindow):
         self._adjust_timer.setSingleShot(True)
         self._adjust_timer.timeout.connect(self._dispatch_adjust)
         self._app = None  # set by LumaApp after construction
+        # Search state
+        self._search_meta_mode: bool = False
+        self._search_seq: int = 0
+        self._search_stop: Optional[threading.Event] = None
+        self._search_pool = QThreadPool()
+        self._search_pool.setMaxThreadCount(1)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(300)
+        self._search_timer.timeout.connect(self._start_meta_scan)
+        self._search_refresh_timer = QTimer(self)
+        self._search_refresh_timer.setSingleShot(True)
+        self._search_refresh_timer.setInterval(250)
+        self._search_refresh_timer.timeout.connect(self._do_search_refresh)
 
         self.setWindowTitle("Luma Viewer")
         self.resize(1280, 800)
@@ -631,11 +749,15 @@ class MainWindow(QMainWindow):
             return
         # Cancel all pending background work so threads can exit promptly
         self._adjust_timer.stop()
+        self._search_timer.stop()
+        self._search_refresh_timer.stop()
         if self._fullres_cancel is not None:
             self._fullres_cancel.set()
+        self._cancel_meta_scan()
         for pool in (
             self._preview_pool, self._fullres_pool,
             self._thumb_pool, self._prefetch_pool, self._adjust_pool,
+            self._search_pool,
         ):
             pool.clear()
         self._settings.save_geometry(self.saveGeometry())
@@ -678,6 +800,50 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(self._nav_label, stretch=1)
         nav_layout.addWidget(self._nav_expand_btn)
         left_layout.addWidget(nav_bar)
+
+        # Search bar (below nav bar, hidden by default)
+        search_bar = QWidget()
+        search_bar.setFixedHeight(28)
+        search_bar.setStyleSheet("background: #252525; border-bottom: 1px solid #2e2e2e;")
+        sl = QHBoxLayout(search_bar)
+        sl.setContentsMargins(4, 3, 4, 3)
+        sl.setSpacing(2)
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Search…")
+        self._search_edit.setStyleSheet("""
+            QLineEdit {
+                background: #1a1a1a; color: #ddd; border: 1px solid #3a3a3a;
+                border-radius: 3px; padding: 1px 5px; font-size: 11px;
+            }
+            QLineEdit:focus { border-color: #4a8ccf; }
+        """)
+        self._search_meta_btn = QPushButton("M")
+        self._search_meta_btn.setFixedSize(20, 20)
+        self._search_meta_btn.setCheckable(True)
+        self._search_meta_btn.setToolTip("Include metadata in search")
+        self._search_meta_btn.setStyleSheet("""
+            QPushButton { background: #2a2a2a; color: #888; border: 1px solid #3a3a3a;
+                          border-radius: 3px; font-size: 10px; font-weight: bold; }
+            QPushButton:checked { background: #1a4a7a; color: #4af; border-color: #4a8ccf; }
+            QPushButton:hover   { color: #ccc; }
+        """)
+        self._search_clear_btn = QPushButton("✕")
+        self._search_clear_btn.setFixedSize(20, 20)
+        self._search_clear_btn.setToolTip("Clear search")
+        self._search_clear_btn.setStyleSheet(
+            "QPushButton { background: transparent; color: #666; border: none; font-size: 11px; }"
+            "QPushButton:hover { color: #ccc; }"
+        )
+        self._search_count_lbl = QLabel("")
+        self._search_count_lbl.setStyleSheet("color: #666; font-size: 10px; min-width: 30px;")
+        self._search_count_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        sl.addWidget(self._search_edit, stretch=1)
+        sl.addWidget(self._search_meta_btn)
+        sl.addWidget(self._search_clear_btn)
+        sl.addWidget(self._search_count_lbl)
+        self._search_bar = search_bar
+        search_bar.hide()
+        left_layout.addWidget(search_bar)
 
         self._grid = GridView(self._folder_model, left)
         left_layout.addWidget(self._grid, stretch=1)
@@ -771,6 +937,11 @@ class MainWindow(QMainWindow):
         self._meta_panel_act.toggled.connect(self._on_metadata_panel_toggled)
         view_menu.addAction(self._meta_panel_act)
 
+        search_act = QAction("&Search…", self)
+        search_act.setShortcut(QKeySequence("Ctrl+F"))
+        search_act.triggered.connect(self._toggle_search_bar)
+        view_menu.addAction(search_act)
+
         # Edit
         edit_menu = mb.addMenu("&Edit")
         self._act_crop = QAction("&Crop…", self)
@@ -852,6 +1023,11 @@ class MainWindow(QMainWindow):
         self._grid.multi_selection_changed.connect(self._meta_panel.set_selected_paths)
         self._meta_panel.closed.connect(lambda: self._meta_panel_act.setChecked(False))
         self._meta_panel.save_requested.connect(self._save_metadata)
+        self._grid.filter_stats_changed.connect(self._on_filter_stats_changed)
+        self._search_edit.textChanged.connect(self._on_search_text_changed)
+        self._search_meta_btn.toggled.connect(self._on_meta_search_toggled)
+        self._search_clear_btn.clicked.connect(self._clear_search)
+        self._expanded_overlay._search_input.textChanged.connect(self._on_overlay_search_changed)
         ss = self._container.slideshow_bar
         ss.play_pause_requested.connect(self._slideshow_toggle_play)
         ss.stop_requested.connect(self._exit_slideshow)
@@ -895,6 +1071,7 @@ class MainWindow(QMainWindow):
         self._folder_model.load_folder(folder)
         self._settings.last_folder = folder
         self._grid.clear_extra_selection()
+        self._cancel_meta_scan()
         self._grid.refresh()
         self._thumbnails_loaded = False
         self._update_nav_bar()
@@ -1214,6 +1391,109 @@ class MainWindow(QMainWindow):
         else:
             self._meta_panel.hide()
         self._settings.set("view/metadata_panel_visible", checked)
+
+    # ------------------------------------------------------------------ #
+    # Search                                                               #
+    # ------------------------------------------------------------------ #
+
+    def _toggle_search_bar(self) -> None:
+        if self._expanded_overlay.isVisible():
+            self._expanded_overlay._search_input.setFocus()
+            self._expanded_overlay._search_input.selectAll()
+            return
+        if not self._left_panel.isVisible():
+            self._left_panel.show()
+        if self._search_bar.isHidden():
+            self._search_bar.show()
+            self._search_edit.setFocus()
+            self._search_edit.selectAll()
+        else:
+            self._clear_search()
+            self._search_bar.hide()
+
+    def _clear_search(self) -> None:
+        self._search_edit.blockSignals(True)
+        self._search_edit.clear()
+        self._search_edit.blockSignals(False)
+        self._apply_search_filter("")
+        self._search_count_lbl.setText("")
+
+    def _on_search_text_changed(self, text: str) -> None:
+        self._apply_search_filter(text)
+        if self._search_meta_mode and text.strip():
+            self._search_timer.start()
+        else:
+            self._search_timer.stop()
+
+    def _on_overlay_search_changed(self, text: str) -> None:
+        if self._search_edit.text() != text:
+            self._search_edit.blockSignals(True)
+            self._search_edit.setText(text)
+            self._search_edit.blockSignals(False)
+        self._apply_search_filter(text)
+        if self._search_meta_mode and text.strip():
+            self._search_timer.start()
+        else:
+            self._search_timer.stop()
+
+    def _apply_search_filter(self, text: str) -> None:
+        self._grid.set_filter(text)
+        self._expanded_overlay.set_filter(text)
+        vis, total = self._grid._thumb_model.filter_stats
+        self._update_search_count(vis, total)
+
+    def _update_search_count(self, visible: int, total: int) -> None:
+        label = f"{visible}/{total}" if visible != total and self._search_edit.text() else ""
+        self._search_count_lbl.setText(label)
+        self._expanded_overlay.set_search_count(visible, total)
+
+    def _on_filter_stats_changed(self, visible: int, total: int) -> None:
+        self._update_search_count(visible, total)
+
+    def _on_meta_search_toggled(self, checked: bool) -> None:
+        self._search_meta_mode = checked
+        if checked and self._search_edit.text().strip():
+            self._start_meta_scan()
+        elif not checked and self._search_stop:
+            self._cancel_meta_scan()
+
+    def _cancel_meta_scan(self) -> None:
+        if self._search_stop:
+            self._search_stop.set()
+            self._search_stop = None
+        self._search_seq += 1
+
+    def _start_meta_scan(self) -> None:
+        text = self._search_edit.text().strip()
+        if not text:
+            return
+        self._cancel_meta_scan()
+        self._search_seq += 1
+        stop = threading.Event()
+        self._search_stop = stop
+        worker = _MetaScanWorker(self._folder_model, self._loader, self._search_seq, stop)
+        worker.signals.meta_ready.connect(self._on_meta_scan_result)
+        worker.signals.finished.connect(self._on_meta_scan_done)
+        self._search_pool.start(worker)
+
+    def _on_meta_scan_result(self, idx: int, search_text: str, seq: int) -> None:
+        if seq != self._search_seq:
+            return
+        if 0 <= idx < self._folder_model.count:
+            self._folder_model[idx].search_text = search_text
+        if not self._search_refresh_timer.isActive():
+            self._search_refresh_timer.start()
+
+    def _on_meta_scan_done(self, seq: int) -> None:
+        if seq != self._search_seq:
+            return
+        self._do_search_refresh()
+
+    def _do_search_refresh(self) -> None:
+        self._grid.refresh_filter()
+        self._expanded_overlay.refresh_filter()
+        vis, total = self._grid._thumb_model.filter_stats
+        self._update_search_count(vis, total)
 
     def _toggle_filmstrip(self) -> None:
         self._left_panel.setVisible(not self._left_panel.isVisible())
