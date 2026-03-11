@@ -85,6 +85,11 @@ def _pil_to_qimage(pil_img) -> QImage:
     return QImage(arr.data, w, h, w * ch, QImage.Format.Format_RGB888).copy()
 
 
+def _xp_encode(s: str) -> bytes:
+    """Encode a string to null-terminated UTF-16LE for Windows XP EXIF tags."""
+    return (s + "\x00").encode("utf-16-le")
+
+
 def _write_exif_jpeg(path: Path, fields: dict) -> None:
     """Losslessly insert/update EXIF tags in a JPEG file using piexif."""
     import piexif
@@ -93,12 +98,16 @@ def _write_exif_jpeg(path: Path, fields: dict) -> None:
     except Exception:
         exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
     ifd = exif_dict.setdefault("0th", {})
+    if fields.get("title") is not None:
+        ifd[piexif.ImageIFD.XPTitle] = _xp_encode(fields["title"])
+    if fields.get("description") is not None:
+        ifd[piexif.ImageIFD.ImageDescription] = fields["description"].encode("utf-8")
+    if fields.get("keywords") is not None:
+        ifd[piexif.ImageIFD.XPKeywords] = _xp_encode(fields["keywords"])
     if fields.get("copyright") is not None:
         ifd[piexif.ImageIFD.Copyright] = fields["copyright"].encode("utf-8")
     if fields.get("artist") is not None:
         ifd[piexif.ImageIFD.Artist] = fields["artist"].encode("utf-8")
-    if fields.get("description") is not None:
-        ifd[piexif.ImageIFD.ImageDescription] = fields["description"].encode("utf-8")
     piexif.insert(piexif.dump(exif_dict), str(path))
 
 
@@ -107,12 +116,16 @@ def _write_exif_pillow(path: Path, fields: dict) -> None:
     from PIL import Image
     with Image.open(path) as img:
         exif = img.getexif()
+        if fields.get("title") is not None:
+            exif[40091] = _xp_encode(fields["title"])
+        if fields.get("description") is not None:
+            exif[270] = fields["description"]
+        if fields.get("keywords") is not None:
+            exif[40094] = _xp_encode(fields["keywords"])
         if fields.get("copyright") is not None:
             exif[33432] = fields["copyright"]
         if fields.get("artist") is not None:
             exif[315] = fields["artist"]
-        if fields.get("description") is not None:
-            exif[270] = fields["description"]
         suffix = path.suffix.lower()
         save_kwargs: dict = {"exif": exif.tobytes()}
         if suffix in {".tif", ".tiff"}:

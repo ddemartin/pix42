@@ -19,6 +19,13 @@ _WRITABLE_SUFFIXES = frozenset({".jpg", ".jpeg", ".tif", ".tiff", ".png", ".webp
 _JPEG_SUFFIXES = frozenset({".jpg", ".jpeg"})
 
 
+def _decode_xp_tag(val) -> str:
+    """Decode a Windows XP* EXIF tag (UTF-16LE bytes) to a plain string."""
+    if isinstance(val, bytes):
+        return val.decode("utf-16-le").rstrip("\x00")
+    return str(val).rstrip("\x00") if val else ""
+
+
 def _fmt_exposure(val) -> str:
     try:
         if isinstance(val, tuple):
@@ -196,10 +203,14 @@ class MetadataPanel(QWidget):
 
         # Edit (writable)
         cl.addWidget(_SectionLabel("Edit"))
+        self._edit_title       = _EditRow("Title")
+        self._edit_description = _EditRow("Description")
+        self._edit_keywords    = _EditRow("Keywords")
+        self._edit_keywords.edit.setPlaceholderText("e.g. sunset; travel; landscape")
         self._edit_copyright   = _EditRow("Copyright")
         self._edit_artist      = _EditRow("Artist")
-        self._edit_description = _EditRow("Description")
-        for row in (self._edit_copyright, self._edit_artist, self._edit_description):
+        for row in (self._edit_title, self._edit_description, self._edit_keywords,
+                    self._edit_copyright, self._edit_artist):
             cl.addWidget(row)
 
         cl.addStretch()
@@ -281,14 +292,16 @@ class MetadataPanel(QWidget):
             self._row_focal.set_value("—")
 
         # Editable fields
+        self._edit_title.set_value(_decode_xp_tag(exif.get("XPTitle") or ""))
+        self._edit_description.set_value(str(exif.get("ImageDescription", "") or "").strip())
+        self._edit_keywords.set_value(_decode_xp_tag(exif.get("XPKeywords") or ""))
         self._edit_copyright.set_value(str(exif.get("Copyright", "") or "").strip())
         self._edit_artist.set_value(str(exif.get("Artist", "") or "").strip())
-        self._edit_description.set_value(str(exif.get("ImageDescription", "") or "").strip())
 
         writable = path.suffix.lower() in _WRITABLE_SUFFIXES
-        self._edit_copyright.set_enabled(writable)
-        self._edit_artist.set_enabled(writable)
-        self._edit_description.set_enabled(writable)
+        for row in (self._edit_title, self._edit_description, self._edit_keywords,
+                    self._edit_copyright, self._edit_artist):
+            row.set_enabled(writable)
         self._save_btn.setEnabled(writable)
         if not writable:
             self._note_lbl.setText(
@@ -319,16 +332,19 @@ class MetadataPanel(QWidget):
         for row in (self._row_camera, self._row_datetime, self._row_shutter,
                     self._row_aperture, self._row_iso, self._row_focal):
             row.set_value("—")
-        for row in (self._edit_copyright, self._edit_artist, self._edit_description):
+        for row in (self._edit_title, self._edit_description, self._edit_keywords,
+                    self._edit_copyright, self._edit_artist):
             row.set_value("")
             row.set_enabled(False)
         self._note_lbl.setText("")
 
     def _on_save(self) -> None:
         fields = {
+            "title":       self._edit_title.value(),
+            "description": self._edit_description.value(),
+            "keywords":    self._edit_keywords.value(),
             "copyright":   self._edit_copyright.value(),
             "artist":      self._edit_artist.value(),
-            "description": self._edit_description.value(),
         }
         if len(self._selected_paths) > 1:
             paths = self._selected_paths
