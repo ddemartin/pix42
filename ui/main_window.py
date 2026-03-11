@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QObject, QRect, QRunnable, QThreadPool, QPoint, QTimer, Signal, QEvent, Slot
-from PySide6.QtCore import QFile
+from PySide6.QtCore import QFile, QFileSystemWatcher
 from PySide6.QtGui import QAction, QColor, QImage, QKeySequence, QMouseEvent, QMovie
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
@@ -692,6 +692,14 @@ class MainWindow(QMainWindow):
         self._search_refresh_timer.setInterval(250)
         self._search_refresh_timer.timeout.connect(self._do_search_refresh)
 
+        # Folder watcher: detects files added / removed while the folder is open.
+        self._fs_watcher = QFileSystemWatcher(self)
+        self._fs_watcher.directoryChanged.connect(self._on_dir_changed)
+        self._watcher_timer = QTimer(self)
+        self._watcher_timer.setSingleShot(True)
+        self._watcher_timer.setInterval(500)
+        self._watcher_timer.timeout.connect(self._apply_folder_changes)
+
         self.setWindowTitle("Luma Viewer")
         self.resize(1280, 800)
         self._build_ui()
@@ -732,6 +740,7 @@ class MainWindow(QMainWindow):
         if last_folder:
             log.info("Restoring last folder: %s", last_folder)
             self._folder_model.load_folder(last_folder)
+            self._watch_folder(last_folder)
             self._grid.refresh()
             self._thumbnails_loaded = False
             self._update_nav_bar()
@@ -1069,6 +1078,7 @@ class MainWindow(QMainWindow):
         self._container.viewer._stop_movie()
         self._container.media_player.stop()
         self._folder_model.load_folder(folder)
+        self._watch_folder(folder)
         self._settings.last_folder = folder
         self._grid.clear_extra_selection()
         self._cancel_meta_scan()
@@ -1091,6 +1101,7 @@ class MainWindow(QMainWindow):
             self._folder_model.go_to_path(path)
         else:
             self._folder_model.load_single_file(path)
+            self._watch_folder(path.parent)
             self._settings.last_folder = path.parent
             self._grid.refresh()
             self._thumbnails_loaded = False
@@ -1325,6 +1336,7 @@ class MainWindow(QMainWindow):
     def _load_drives(self) -> None:
         self._container.viewer._stop_movie()
         self._container.media_player.stop()
+        self._watch_folder(None)
         self._folder_model.load_drives()
         self._grid.refresh()
         self._thumbnails_loaded = True
@@ -1341,6 +1353,46 @@ class MainWindow(QMainWindow):
         self._nav_label.setText(folder.name or folder.drive or str(folder))
         self._nav_label.setToolTip(str(folder))
         self._nav_up_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------ #
+    # Folder watcher                                                       #
+    # ------------------------------------------------------------------ #
+
+    def _watch_folder(self, folder: Optional[Path]) -> None:
+        """Set *folder* as the watched directory, replacing any previous watch."""
+        dirs = self._fs_watcher.directories()
+        if dirs:
+            self._fs_watcher.removePaths(dirs)
+        if folder is not None:
+            self._fs_watcher.addPath(str(folder))
+
+    def _on_dir_changed(self) -> None:
+        """Slot: filesystem change detected — debounce before processing."""
+        self._watcher_timer.start()
+
+    def _apply_folder_changes(self) -> None:
+        """Sync the folder model with what's on disk and refresh the grid."""
+        added, removed = self._folder_model.sync_folder()
+        if not added and not removed:
+            return
+
+        current = self._folder_model.current
+        self._grid.refresh()
+        if current is not None:
+            self._grid.select_path(current.path)
+
+        # Enqueue thumbnails for newly arrived files without discarding existing ones.
+        for path in added:
+            if path.suffix.lower() not in _AUDIO_EXTENSIONS:
+                self._thumb_queue.appendleft(path)
+        if added:
+            self._dispatch_next_thumb()
+
+        n = len(added)
+        if n:
+            self._status_bar.showMessage(
+                f"{n} new file{'s' if n > 1 else ''} detected", 4000
+            )
 
     # ------------------------------------------------------------------ #
     # Zoom / pan callbacks                                                 #

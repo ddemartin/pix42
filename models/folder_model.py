@@ -188,6 +188,65 @@ class FolderModel:
     # Internal                                                             #
     # ------------------------------------------------------------------ #
 
+    def sync_folder(self) -> tuple[list[Path], list[Path]]:
+        """Re-scan the current folder and update entries in-place.
+
+        Returns ``(added, removed)`` path lists.  Preserves existing
+        ``ImageEntry`` objects (thumbnail, search_text, etc.) and keeps the
+        current selection pointing at the same file.
+        """
+        if self._folder is None:
+            return [], []
+        try:
+            children = list(self._folder.iterdir())
+        except PermissionError:
+            return [], []
+
+        dirs = sorted(
+            (
+                p for p in children
+                if p.is_dir()
+                and not p.name.startswith(".")
+                and not p.name.startswith("$")
+            ),
+            key=lambda p: p.name.lower(),
+        )
+        files = sorted(
+            (p for p in children if p.is_file() and _is_supported(p)),
+            key=lambda p: p.name.lower(),
+        )
+        new_list = (
+            [ImageEntry(path=p, is_dir=True) for p in dirs]
+            + [ImageEntry(path=p) for p in files]
+        )
+
+        old_path_set = {e.path for e in self._entries}
+        new_path_set = {e.path for e in new_list}
+        added   = [e.path for e in new_list    if e.path not in old_path_set]
+        removed = [e.path for e in self._entries if e.path not in new_path_set]
+
+        if not added and not removed:
+            return [], []
+
+        # Carry over thumbnail / metadata / search_text from existing entries
+        existing = {e.path: e for e in self._entries}
+        merged = [existing.get(e.path, e) for e in new_list]
+
+        current_path = (
+            self._entries[self._current_index].path
+            if 0 <= self._current_index < len(self._entries)
+            else None
+        )
+        self._entries = merged
+
+        if current_path is not None:
+            idx = self._index_of(current_path)
+            self._current_index = idx if idx >= 0 else min(self._current_index, len(self._entries) - 1)
+        else:
+            self._current_index = -1
+
+        return added, removed
+
     def _index_of(self, path: Path) -> int:
         for i, entry in enumerate(self._entries):
             if entry.path == path:
