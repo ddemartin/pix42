@@ -153,7 +153,7 @@ class SettingsDialog(QDialog):
         self._current_theme = settings.theme
 
         self.setWindowTitle("Settings")
-        self.setFixedSize(420, 470)
+        self.setFixedSize(420, 440)
         self.setModal(True)
         self.setStyleSheet(_make_style(self._current_theme))
         self._build_ui()
@@ -170,6 +170,7 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._appearance_tab(), "Appearance")
         tabs.addTab(self._behavior_tab(), "Behavior")
+        tabs.addTab(self._startup_tab(), "Startup")
         tabs.addTab(self._system_tab(), "System")
         root.addWidget(tabs)
 
@@ -266,36 +267,6 @@ class SettingsDialog(QDialog):
 
         layout.addSpacing(8)
 
-        hdr2 = QLabel("Startup")
-        hdr2.setObjectName("sectionHeader")
-        layout.addWidget(hdr2)
-
-        self._start_fullscreen_cb = QCheckBox("Start in fullscreen mode")
-        self._start_fullscreen_cb.setChecked(self._orig_start_fullscreen)
-        layout.addWidget(self._start_fullscreen_cb)
-
-        self._restore_last_image_cb = QCheckBox("Restore last viewed image on startup")
-        self._restore_last_image_cb.setChecked(self._orig_restore_last_image)
-        layout.addWidget(self._restore_last_image_cb)
-
-        self._filmstrip_visible_cb = QCheckBox("Show filmstrip on startup")
-        self._filmstrip_visible_cb.setChecked(self._orig_filmstrip_visible)
-        layout.addWidget(self._filmstrip_visible_cb)
-
-        layout.addSpacing(8)
-
-        hdr_fs = QLabel("Filmstrip")
-        hdr_fs.setObjectName("sectionHeader")
-        layout.addWidget(hdr_fs)
-
-        self._filmstrip_recursive_cb = QCheckBox(
-            "Show images from current folder and all subdirectories"
-        )
-        self._filmstrip_recursive_cb.setChecked(self._orig_filmstrip_recursive)
-        layout.addWidget(self._filmstrip_recursive_cb)
-
-        layout.addSpacing(8)
-
         hdr3 = QLabel("Media")
         hdr3.setObjectName("sectionHeader")
         layout.addWidget(hdr3)
@@ -303,6 +274,50 @@ class SettingsDialog(QDialog):
         self._media_start_muted_cb = QCheckBox("Start video and audio muted (safe for work)")
         self._media_start_muted_cb.setChecked(self._orig_media_start_muted)
         layout.addWidget(self._media_start_muted_cb)
+
+        layout.addStretch()
+        return tab
+
+    def _startup_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 8)
+        layout.setSpacing(12)
+
+        hdr1 = QLabel("Window")
+        hdr1.setObjectName("sectionHeader")
+        layout.addWidget(hdr1)
+
+        self._start_fullscreen_cb = QCheckBox("Start in fullscreen mode")
+        self._start_fullscreen_cb.setChecked(self._orig_start_fullscreen)
+        layout.addWidget(self._start_fullscreen_cb)
+
+        layout.addSpacing(8)
+
+        hdr2 = QLabel("Session restore")
+        hdr2.setObjectName("sectionHeader")
+        layout.addWidget(hdr2)
+
+        self._restore_last_image_cb = QCheckBox("Restore last viewed image on startup")
+        self._restore_last_image_cb.setChecked(self._orig_restore_last_image)
+        layout.addWidget(self._restore_last_image_cb)
+
+        layout.addSpacing(8)
+
+        hdr3 = QLabel("Filmstrip")
+        hdr3.setObjectName("sectionHeader")
+        layout.addWidget(hdr3)
+
+        self._filmstrip_visible_cb = QCheckBox("Show filmstrip on startup")
+        self._filmstrip_visible_cb.setChecked(self._orig_filmstrip_visible)
+        layout.addWidget(self._filmstrip_visible_cb)
+
+        self._filmstrip_recursive_cb = QCheckBox(
+            "Show images from current folder and all subdirectories"
+        )
+        self._filmstrip_recursive_cb.setChecked(self._orig_filmstrip_recursive)
+        layout.addWidget(self._filmstrip_recursive_cb)
 
         layout.addStretch()
         return tab
