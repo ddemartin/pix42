@@ -91,6 +91,25 @@ class FolderModel:
         self._entries = [ImageEntry(path=d, is_dir=True) for d in drives]
         self._current_index = -1
 
+    def load_folder_recursive(self, folder: Path) -> None:
+        """Scan *folder* and all subdirectories; populate with files only (flat list)."""
+        self._folder = folder
+        files: list[Path] = []
+        try:
+            for root, dirs, fnames in os.walk(folder):
+                dirs[:] = sorted(
+                    d for d in dirs
+                    if not d.startswith(".") and not d.startswith("$")
+                )
+                for fname in sorted(fnames):
+                    p = Path(root) / fname
+                    if _is_supported(p):
+                        files.append(p)
+        except PermissionError:
+            pass
+        self._entries = [ImageEntry(path=p) for p in files]
+        self._current_index = 0 if self._entries else -1
+
     def load_single_file(self, path: Path) -> None:
         """Load the folder containing *path* and select that file."""
         self.load_folder(path.parent)

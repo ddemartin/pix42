@@ -49,6 +49,29 @@ class SettingsManager:
         self._s.setValue("general/last_folder", str(folder))
         self._s.sync()
 
+    @property
+    def last_image(self) -> Optional[Path]:
+        """Return the last viewed image file, or None if missing/not set."""
+        raw = self._s.value("general/last_image", None)
+        if raw:
+            p = Path(raw)
+            return p if p.is_file() else None
+        return None
+
+    @last_image.setter
+    def last_image(self, path: Path) -> None:
+        self._s.setValue("general/last_image", str(path))
+        self._s.sync()
+
+    @property
+    def restore_last_image(self) -> bool:
+        return self._s.value("behavior/restore_last_image", False, type=bool)
+
+    @restore_last_image.setter
+    def restore_last_image(self, value: bool) -> None:
+        self._s.setValue("behavior/restore_last_image", value)
+        self._s.sync()
+
     # ------------------------------------------------------------------ #
     # Window geometry & state                                              #
     # ------------------------------------------------------------------ #
@@ -172,6 +195,15 @@ class SettingsManager:
     @filmstrip_visible.setter
     def filmstrip_visible(self, value: bool) -> None:
         self._s.setValue("behavior/filmstrip_visible", value)
+        self._s.sync()
+
+    @property
+    def filmstrip_recursive(self) -> bool:
+        return self._s.value("behavior/filmstrip_recursive", False, type=bool)
+
+    @filmstrip_recursive.setter
+    def filmstrip_recursive(self, value: bool) -> None:
+        self._s.setValue("behavior/filmstrip_recursive", value)
         self._s.sync()
 
     # ------------------------------------------------------------------ #

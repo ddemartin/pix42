@@ -141,7 +141,9 @@ class SettingsDialog(QDialog):
         self._orig_confirm_delete_file = settings.confirm_delete_file
         self._orig_confirm_delete_folder = settings.confirm_delete_folder
         self._orig_start_fullscreen = settings.start_fullscreen
+        self._orig_restore_last_image = settings.restore_last_image
         self._orig_filmstrip_visible = settings.filmstrip_visible
+        self._orig_filmstrip_recursive = settings.filmstrip_recursive
         self._orig_media_start_muted = settings.media_start_muted
         self._orig_close_to_tray = settings.close_to_tray
         self._orig_run_at_startup = settings.run_at_startup
@@ -272,9 +274,25 @@ class SettingsDialog(QDialog):
         self._start_fullscreen_cb.setChecked(self._orig_start_fullscreen)
         layout.addWidget(self._start_fullscreen_cb)
 
+        self._restore_last_image_cb = QCheckBox("Restore last viewed image on startup")
+        self._restore_last_image_cb.setChecked(self._orig_restore_last_image)
+        layout.addWidget(self._restore_last_image_cb)
+
         self._filmstrip_visible_cb = QCheckBox("Show filmstrip on startup")
         self._filmstrip_visible_cb.setChecked(self._orig_filmstrip_visible)
         layout.addWidget(self._filmstrip_visible_cb)
+
+        layout.addSpacing(8)
+
+        hdr_fs = QLabel("Filmstrip")
+        hdr_fs.setObjectName("sectionHeader")
+        layout.addWidget(hdr_fs)
+
+        self._filmstrip_recursive_cb = QCheckBox(
+            "Show images from current folder and all subdirectories"
+        )
+        self._filmstrip_recursive_cb.setChecked(self._orig_filmstrip_recursive)
+        layout.addWidget(self._filmstrip_recursive_cb)
 
         layout.addSpacing(8)
 
@@ -355,7 +373,9 @@ class SettingsDialog(QDialog):
         self._settings.confirm_delete_file = self._confirm_delete_file_cb.isChecked()
         self._settings.confirm_delete_folder = self._confirm_delete_folder_cb.isChecked()
         self._settings.start_fullscreen = self._start_fullscreen_cb.isChecked()
+        self._settings.restore_last_image = self._restore_last_image_cb.isChecked()
         self._settings.filmstrip_visible = self._filmstrip_visible_cb.isChecked()
+        self._settings.filmstrip_recursive = self._filmstrip_recursive_cb.isChecked()
         self._settings.media_start_muted = self._media_start_muted_cb.isChecked()
 
         new_tray = self._close_to_tray_cb.isChecked()

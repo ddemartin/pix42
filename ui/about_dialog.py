@@ -156,6 +156,15 @@ class AboutDialog(QDialog):
         site_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://www.demahub.com")))
         root.addWidget(site_btn)
 
+        root.addSpacing(2)
+
+        # Email link
+        mail_btn = QPushButton("ddemartin@gmail.com")
+        mail_btn.setObjectName("linkBtn")
+        mail_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mail_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("mailto:ddemartin@gmail.com")))
+        root.addWidget(mail_btn)
+
         root.addSpacing(20)
 
         # Divider

@@ -775,14 +775,23 @@ class MainWindow(QMainWindow):
         if self._settings.start_fullscreen:
             self.showFullScreen()
 
-        last_folder = self._settings.last_folder or _default_pictures_dir()
+        last_image = self._settings.last_image if self._settings.restore_last_image else None
+        last_folder = (
+            last_image.parent
+            if last_image is not None
+            else self._settings.last_folder or _default_pictures_dir()
+        )
         if last_folder:
             log.info("Restoring last folder: %s", last_folder)
-            self._folder_model.load_folder(last_folder)
+            self._load_folder_into_model(last_folder)
             self._watch_folder(last_folder)
+            if last_image is not None:
+                self._folder_model.go_to_path(last_image)
             self._grid.refresh()
             self._thumbnails_loaded = False
             self._update_nav_bar()
+            if last_image is not None:
+                self._grid.select_path(last_image)
             self._load_current()
 
     def _apply_saved_splitter_sizes(self) -> None:
@@ -836,6 +845,7 @@ class MainWindow(QMainWindow):
                     self._settings.filmstrip_width = sizes[0]
                 if sizes[2] > 0:
                     self._settings.metadata_panel_width = sizes[2]
+        self._settings.filmstrip_visible = self._left_panel.isVisible()
         super().closeEvent(event)
         # setQuitOnLastWindowClosed(False) is set globally for tray support,
         # so we must quit the event loop explicitly when actually closing.
@@ -853,20 +863,30 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(0)
 
-        # Nav bar: [↑]  folder name
+        # Nav bar: [↑]  folder name  [grid]
+        _tb_dir = ASSETS_DIR / "icons" / "toolbar"
+
+        def _nav_icon(name: str) -> QIcon:
+            p = _tb_dir / name
+            return QIcon(str(p)) if p.exists() else QIcon()
+
         nav_bar = QWidget()
-        nav_bar.setFixedHeight(28)
+        nav_bar.setFixedHeight(34)
         nav_layout = QHBoxLayout(nav_bar)
-        nav_layout.setContentsMargins(4, 2, 4, 2)
+        nav_layout.setContentsMargins(4, 3, 4, 3)
         nav_layout.setSpacing(4)
-        self._nav_up_btn = QPushButton("↑")
-        self._nav_up_btn.setFixedSize(22, 22)
+        self._nav_up_btn = QPushButton()
+        self._nav_up_btn.setIcon(_nav_icon("folder-up.svg"))
+        self._nav_up_btn.setIconSize(QSize(20, 20))
+        self._nav_up_btn.setFixedSize(28, 28)
         self._nav_up_btn.setToolTip("Go to parent folder")
         self._nav_up_btn.setEnabled(False)
         self._nav_label = QLabel("")
         self._nav_label.setStyleSheet("color: #aaa; font-size: 11px;")
-        self._nav_expand_btn = QPushButton("⊞")
-        self._nav_expand_btn.setFixedSize(22, 22)
+        self._nav_expand_btn = QPushButton()
+        self._nav_expand_btn.setIcon(_nav_icon("grid.svg"))
+        self._nav_expand_btn.setIconSize(QSize(20, 20))
+        self._nav_expand_btn.setFixedSize(28, 28)
         self._nav_expand_btn.setToolTip("Open full-window thumbnail browser")
         nav_layout.addWidget(self._nav_up_btn)
         nav_layout.addWidget(self._nav_label, stretch=1)
@@ -919,6 +939,26 @@ class MainWindow(QMainWindow):
 
         self._grid = GridView(self._folder_model, left)
         left_layout.addWidget(self._grid, stretch=1)
+
+        # Bottom of strip: "Next folder" button
+        self._nav_next_folder_btn = QPushButton()
+        self._nav_next_folder_btn.setIcon(_nav_icon("folder-next.svg"))
+        self._nav_next_folder_btn.setIconSize(QSize(20, 20))
+        self._nav_next_folder_btn.setFixedHeight(28)
+        self._nav_next_folder_btn.setToolTip("Next sibling folder")
+        self._nav_next_folder_btn.setEnabled(False)
+        self._nav_next_folder_btn.setStyleSheet("""
+            QPushButton {
+                background: #252525; color: #888; border: none;
+                border-top: 1px solid #2e2e2e;
+                border-radius: 0;
+            }
+            QPushButton:enabled:hover  { background: #2e2e2e; color: #ccc; }
+            QPushButton:enabled:pressed { background: #333; }
+            QPushButton:disabled { opacity: 0.35; }
+        """)
+        left_layout.addWidget(self._nav_next_folder_btn)
+
         left.setMinimumWidth(180)
         left.setMaximumWidth(260)
 
@@ -1178,6 +1218,7 @@ class MainWindow(QMainWindow):
         self._grid.scroll_changed.connect(self._reprioritize_thumbnails)
         self._nav_up_btn.clicked.connect(self._go_up)
         self._nav_expand_btn.clicked.connect(self._open_expanded_grid)
+        self._nav_next_folder_btn.clicked.connect(self._go_next_folder)
         self._container.navigator.pan_requested.connect(self._on_navigator_pan)
         self._container.toggle_filmstrip.connect(self._toggle_filmstrip)
         self._container.media_player.error_occurred.connect(
@@ -1236,10 +1277,17 @@ class MainWindow(QMainWindow):
         if folder:
             self._open_folder(Path(folder))
 
+    def _load_folder_into_model(self, folder: Path) -> None:
+        """Call the right FolderModel loader based on the recursive setting."""
+        if self._settings.filmstrip_recursive:
+            self._folder_model.load_folder_recursive(folder)
+        else:
+            self._folder_model.load_folder(folder)
+
     def _open_folder(self, folder: Path) -> None:
         self._container.viewer._stop_movie()
         self._container.media_player.stop()
-        self._folder_model.load_folder(folder)
+        self._load_folder_into_model(folder)
         self._watch_folder(folder)
         self._settings.last_folder = folder
         self._grid.clear_extra_selection()
@@ -1294,6 +1342,8 @@ class MainWindow(QMainWindow):
         if entry is None:
             return
         self._lbl_path.setText(str(entry.path))
+        if not entry.is_dir and self._settings.restore_last_image:
+            self._settings.last_image = entry.path
         # Cancel any in-flight full-res worker for the previous image.
         if self._fullres_cancel is not None:
             self._fullres_cancel.set()
@@ -1498,6 +1548,29 @@ class MainWindow(QMainWindow):
         else:
             self._open_folder(folder.parent)
 
+    @staticmethod
+    def _next_sibling_folder(folder: Path) -> Optional[Path]:
+        """Return the next sibling directory after *folder*, or None."""
+        parent = folder.parent
+        if parent == folder:
+            return None
+        try:
+            siblings = sorted(p for p in parent.iterdir() if p.is_dir())
+        except OSError:
+            return None
+        for i, p in enumerate(siblings):
+            if p == folder and i + 1 < len(siblings):
+                return siblings[i + 1]
+        return None
+
+    def _go_next_folder(self) -> None:
+        folder = self._folder_model.current_folder
+        if folder is None:
+            return
+        nxt = self._next_sibling_folder(folder)
+        if nxt:
+            self._open_folder(nxt)
+
     def _load_drives(self) -> None:
         self._container.viewer._stop_movie()
         self._container.media_player.stop()
@@ -1514,10 +1587,13 @@ class MainWindow(QMainWindow):
             self._nav_label.setText("Computer")
             self._nav_label.setToolTip("")
             self._nav_up_btn.setEnabled(False)
+            self._nav_next_folder_btn.setEnabled(False)
             return
         self._nav_label.setText(folder.name or folder.drive or str(folder))
         self._nav_label.setToolTip(str(folder))
         self._nav_up_btn.setEnabled(True)
+        has_next = self._next_sibling_folder(folder) is not None
+        self._nav_next_folder_btn.setEnabled(has_next)
 
     # ------------------------------------------------------------------ #
     # Folder watcher                                                       #
@@ -1720,6 +1796,7 @@ class MainWindow(QMainWindow):
                 if w > 0:
                     self._settings.filmstrip_width = w
             self._left_panel.hide()
+            self._settings.filmstrip_visible = False
         else:
             w = self._settings.filmstrip_width
             splitter = self.centralWidget()
@@ -1728,6 +1805,7 @@ class MainWindow(QMainWindow):
                 total = sizes[0] + sizes[1]
                 splitter.setSizes([w, max(200, total - w), sizes[2]])
             self._left_panel.show()
+            self._settings.filmstrip_visible = True
 
     def _start_rename(self) -> None:
         if self._expanded_overlay.isVisible():
@@ -2585,8 +2663,18 @@ class MainWindow(QMainWindow):
             self._load_current()
 
     def _open_settings(self) -> None:
+        prev_recursive = self._settings.filmstrip_recursive
         dlg = SettingsDialog(self._settings, self._container.viewer, self, app=self._app)
         dlg.exec()
+        if self._settings.filmstrip_recursive != prev_recursive:
+            folder = self._folder_model.current_folder
+            if folder is not None:
+                self._load_folder_into_model(folder)
+                self._grid.refresh()
+                self._thumbnails_loaded = False
+                entry = self._folder_model.current
+                if entry:
+                    self._grid.select_path(entry.path)
 
     def _show_about(self) -> None:
         dlg = AboutDialog(self)
